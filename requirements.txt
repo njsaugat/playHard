@@ -1,0 +1,13 @@
+# Ad Detection Pipeline Dependencies
+
+# Database
+psycopg2-binary>=2.9.9
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# HTTP requests
+requests>=2.31.0
+
+# GLiNER2 for NER (already installed for ad_detector.py)
+gliner2>=0.1.0

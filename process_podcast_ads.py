@@ -13,6 +13,7 @@ Key features:
 import os
 import json
 import uuid
+import re
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -23,6 +24,218 @@ from ad_detector import AdDetector, AdConfidence, format_timestamp, ExclusionRea
 
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+
+# =============================================================================
+# ROBUST JSON PARSING UTILITIES
+# =============================================================================
+
+def repair_json(text: str) -> str:
+    """
+    Attempt to repair common JSON issues from LLM responses.
+    
+    Fixes:
+    - Single quotes -> double quotes
+    - Trailing commas
+    - Unquoted keys
+    - Truncated strings (close them)
+    - Missing closing braces
+    """
+    if not text:
+        return text
+    
+    # Remove any markdown code blocks
+    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    text = re.sub(r'\s*```$', '', text.strip())
+    
+    # Replace single quotes with double quotes (but be careful with apostrophes in text)
+    # This is a simple heuristic - replace 'key': with "key":
+    text = re.sub(r"'(\w+)'(\s*:)", r'"\1"\2', text)
+    
+    # Replace trailing single quotes for values that look like strings
+    # 'value' -> "value" but only in JSON context
+    text = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', text)
+    
+    # Remove trailing commas before } or ]
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+    
+    # Count braces to see if we need to close any
+    open_braces = text.count('{') - text.count('}')
+    open_brackets = text.count('[') - text.count(']')
+    
+    # Try to fix unterminated strings by finding the last unclosed quote
+    # This is tricky - if we have an odd number of quotes, try to close
+    quote_count = text.count('"') - text.count('\\"')
+    if quote_count % 2 == 1:
+        # Find the last quote and close the string
+        last_quote_idx = text.rfind('"')
+        if last_quote_idx > 0:
+            # Check if this quote is starting a string (not ending one)
+            # by seeing if there's a colon before it
+            before_quote = text[:last_quote_idx].rstrip()
+            if before_quote.endswith(':') or before_quote.endswith(',') or before_quote.endswith('['):
+                # This is an unclosed string value, close it
+                text = text + '"'
+    
+    # Close any unclosed braces/brackets
+    text = text + ('}' * open_braces) + (']' * open_brackets)
+    
+    return text
+
+
+def extract_json_from_text(text: str) -> str:
+    """
+    Extract JSON object from text that may contain extra content.
+    Uses regex to find the outermost { } pair.
+    """
+    if not text:
+        return text
+    
+    # Try to find a JSON object
+    # Match from first { to the last }
+    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+    if match:
+        return match.group(0)
+    
+    # If no complete object found, try to find start of JSON
+    start_idx = text.find('{')
+    if start_idx >= 0:
+        return text[start_idx:]
+    
+    return text
+
+
+def safe_json_parse(text: str) -> tuple[dict | None, str | None]:
+    """
+    Safely parse JSON with multiple fallback strategies.
+    
+    Returns:
+        (parsed_dict, error_message) - error_message is None on success
+    """
+    if not text or not text.strip():
+        return None, "Empty response"
+    
+    original_text = text
+    
+    # Strategy 1: Direct parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result, None
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            return result[0], None
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 2: Extract JSON object and parse
+    try:
+        extracted = extract_json_from_text(text)
+        result = json.loads(extracted)
+        if isinstance(result, dict):
+            return result, None
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            return result[0], None
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 3: Repair and parse
+    try:
+        repaired = repair_json(text)
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            return result, None
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            return result[0], None
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 4: Extract and repair
+    try:
+        extracted = extract_json_from_text(text)
+        repaired = repair_json(extracted)
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            return result, None
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            return result[0], None
+    except json.JSONDecodeError as e:
+        pass
+    
+    # Strategy 5: Try to build a minimal valid response from regex patterns
+    # This is the last resort - extract key fields manually
+    fallback = try_extract_fields_manually(original_text)
+    if fallback:
+        return fallback, None
+    
+    return None, "All JSON parsing strategies failed"
+
+
+def try_extract_fields_manually(text: str) -> dict | None:
+    """
+    Last resort: try to extract key fields from malformed JSON using regex.
+    """
+    result = {
+        "is_ad": False,
+        "is_brand_love": False,
+        "confidence": 0.0,
+        "sponsor": None,
+        "sponsor_url": None,
+        "promo_code": None,
+        "discount_offer": None,
+        "product_name": None,
+        "ad_type": "unknown",
+        "call_to_action": None,
+        "brand_love_reason": None,
+    }
+    
+    found_something = False
+    
+    # Try to extract is_ad
+    is_ad_match = re.search(r'"is_ad"\s*:\s*(true|false)', text, re.IGNORECASE)
+    if is_ad_match:
+        result["is_ad"] = is_ad_match.group(1).lower() == "true"
+        found_something = True
+    
+    # Try to extract is_brand_love
+    brand_love_match = re.search(r'"is_brand_love"\s*:\s*(true|false)', text, re.IGNORECASE)
+    if brand_love_match:
+        result["is_brand_love"] = brand_love_match.group(1).lower() == "true"
+        found_something = True
+    
+    # Try to extract confidence
+    conf_match = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+    if conf_match:
+        try:
+            result["confidence"] = float(conf_match.group(1))
+            found_something = True
+        except ValueError:
+            pass
+    
+    # Try to extract sponsor
+    sponsor_match = re.search(r'"sponsor"\s*:\s*"([^"]*)"', text)
+    if sponsor_match:
+        result["sponsor"] = sponsor_match.group(1)
+        found_something = True
+    
+    # Try to extract sponsor_url
+    url_match = re.search(r'"sponsor_url"\s*:\s*"([^"]*)"', text)
+    if url_match:
+        result["sponsor_url"] = url_match.group(1)
+        found_something = True
+    
+    # Try to extract promo_code
+    promo_match = re.search(r'"promo_code"\s*:\s*"([^"]*)"', text)
+    if promo_match:
+        result["promo_code"] = promo_match.group(1)
+        found_something = True
+    
+    # Try to extract ad_type
+    type_match = re.search(r'"ad_type"\s*:\s*"([^"]*)"', text)
+    if type_match:
+        result["ad_type"] = type_match.group(1)
+        found_something = True
+    
+    return result if found_something else None
 
 # Load environment variables from .env.local
 load_dotenv('.env.local')
@@ -138,41 +351,108 @@ JSON Schema:
 IMPORTANT: If there's NO URL, NO promo code, NO discount, and NO clear call-to-action,
 this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=0.2 or lower."""
 
+    # Default fallback response
+    default_response = {
+        "is_ad": False, "is_brand_love": False, "confidence": 0, 
+        "sponsor": None, "sponsor_url": None, "promo_code": None,
+        "discount_offer": None, "product_name": None, "ad_type": "unknown",
+        "call_to_action": None, "brand_love_reason": None,
+    }
+    
     try:
         response = model.generate_content(prompt)
+        
+        # 1. Check if we have candidates
+        if not response.candidates:
+            print(f"    ⚠️ No candidates in Gemini response")
+            return default_response
+        
         candidate = response.candidates[0]
-        finish_reason = candidate.finish_reason.name
+        finish_reason = getattr(candidate.finish_reason, "name", "UNKNOWN")
 
         if finish_reason == "SAFETY":
             print(f"    ⚠️ Blocked by Safety Filters")
-            return {"is_ad": False, "confidence": 0, "sponsor": "BLOCKED_BY_SAFETY"}
+            return {**default_response, "sponsor": "BLOCKED_BY_SAFETY"}
         
-        response_text = candidate.content.parts[0].text
-        result = json.loads(response_text)
+        # 2. Check if we have content and parts
+        if not hasattr(candidate, 'content') or candidate.content is None:
+            print(f"    ⚠️ No content in Gemini candidate")
+            return default_response
+            
+        if not hasattr(candidate.content, 'parts') or not candidate.content.parts:
+            print(f"    ⚠️ No parts in Gemini candidate content")
+            return default_response
+
+        # 3. Get response text safely
+        try:
+            response_text = candidate.content.parts[0].text
+        except (IndexError, AttributeError) as e:
+            print(f"    ⚠️ Error accessing response text: {str(e)}")
+            return default_response
         
-        # If brand love detected, force low confidence
-        is_brand_love = result.get("is_brand_love", False)
+        if not response_text or not response_text.strip():
+            print(f"    ⚠️ Empty response text from Gemini")
+            return default_response
+        
+        # 4. Use robust JSON parsing with multiple fallback strategies
+        result, error = safe_json_parse(response_text)
+        
+        if result is None:
+            print(f"    ⚠️ Gemini JSON Parse Failed: {error}")
+            return default_response
+        
+        # 5. If brand love detected, force low confidence
+        is_brand_love = bool(result.get("is_brand_love", False))
         if is_brand_love:
-            result["confidence"] = min(result.get("confidence", 0.2), BRAND_LOVE_CONFIDENCE)
+            conf = 0.2
+            try:
+                raw_conf = result.get("confidence", 0.2)
+                conf = float(raw_conf) if raw_conf is not None else 0.2
+            except (ValueError, TypeError):
+                pass
+            result["confidence"] = min(conf, BRAND_LOVE_CONFIDENCE)
             result["is_ad"] = False
         
+        # 6. Final Schema Enforcement with Safe Type Conversions
+        def safe_str(val):
+            if val is None:
+                return None
+            return str(val).strip() if str(val).strip() else None
+
+        def safe_float(val, default=0.0):
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
+        def safe_bool(val, default=False):
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ('true', '1', 'yes')
+            return bool(val)
+
         return {
-            "is_ad": bool(result.get("is_ad", False)),
-            "is_brand_love": bool(result.get("is_brand_love", False)),
-            "confidence": float(result.get("confidence", 0)),
-            "sponsor": result.get("sponsor"),
-            "sponsor_url": result.get("sponsor_url"),
-            "promo_code": result.get("promo_code"),
-            "discount_offer": result.get("discount_offer"),
-            "product_name": result.get("product_name"),
-            "ad_type": result.get("ad_type", "unknown"),
-            "call_to_action": result.get("call_to_action"),
-            "brand_love_reason": result.get("brand_love_reason"),
+            "is_ad": safe_bool(result.get("is_ad")),
+            "is_brand_love": safe_bool(result.get("is_brand_love")),
+            "confidence": safe_float(result.get("confidence")),
+            "sponsor": safe_str(result.get("sponsor")),
+            "sponsor_url": safe_str(result.get("sponsor_url")),
+            "promo_code": safe_str(result.get("promo_code")),
+            "discount_offer": safe_str(result.get("discount_offer")),
+            "product_name": safe_str(result.get("product_name")),
+            "ad_type": safe_str(result.get("ad_type")) or "unknown",
+            "call_to_action": safe_str(result.get("call_to_action")),
+            "brand_love_reason": safe_str(result.get("brand_love_reason")),
         }
 
     except Exception as e:
-        print(f"    ⚠️ Gemini error: {str(e)}")
-        return {"is_ad": False, "confidence": 0, "sponsor": None}
+        print(f"    ⚠️ Gemini unexpected error: {str(e)}")
+        return default_response
 
 
 def get_db_connection():
@@ -249,9 +529,9 @@ def save_podcast_ad(cursor, episode_id: str, brand_id: str, ad_segment, ad_conte
     
     ad_type_map = {
         "host_read": "HOST_READ",
-        "pre_recorded": "PRE_RECORDED",
-        "dynamic_insertion": "DYNAMIC",
-        "unknown": "UNCLASSIFIED",
+        "pre_recorded": "PRE_PRODUCED",
+        "dynamic_insertion": "DYNAMICALLY_INSERTED",
+        "unknown": "UNKNOWN",
     }
     extracted_type = ad_content.get("adType", "unknown")
     ad_type = ad_type_map.get(extracted_type, "HOST_READ")
@@ -292,8 +572,8 @@ def fetch_episodes(cursor, limit: int = 100000):
         FROM public."PodcastEpisode" as PodcastEpi
         JOIN public."Podcast" as Podcast ON Podcast."id" = PodcastEpi."podcastId"
         WHERE PodcastEpi.duration IS NOT NULL 
-            AND PodcastEpi.duration >= 7000
-            AND PodcastEpi.duration < 7200
+            AND PodcastEpi.duration >= 5400
+            AND PodcastEpi.duration < 6000
             AND PodcastEpi."transcriptUrl" IS NOT NULL 
             AND PodcastEpi."audioUrl" IS NOT NULL 
             AND PodcastEpi."transcriptStatus" = 'COMPLETED' 
@@ -319,6 +599,13 @@ def fetch_transcript(transcript_url: str) -> dict:
 def merge_extraction_data(gliner_data: dict, llm_data: dict) -> dict:
     """Merge GLiNER2 structured data with Gemini extraction."""
     merged = {}
+    
+    # Ensure inputs are dictionaries
+    if not isinstance(gliner_data, dict):
+        gliner_data = {}
+    if not isinstance(llm_data, dict):
+        llm_data = {}
+        
     fields = [
         "sponsor_name", "sponsor_url", "promo_code", "discount_offer",
         "product_name", "ad_type", "call_to_action"
@@ -333,11 +620,14 @@ def merge_extraction_data(gliner_data: dict, llm_data: dict) -> dict:
         "call_to_action": "call_to_action",
     }
     for field in fields:
+        # Use .get() safely
         llm_val = llm_data.get(llm_key_map.get(field, field))
         gliner_val = gliner_data.get(field)
-        if llm_val:
+        
+        # Prefer non-empty LLM value if available
+        if llm_val and str(llm_val).strip():
             merged[field] = llm_val
-        elif gliner_val:
+        elif gliner_val and str(gliner_val).strip():
             merged[field] = gliner_val
     return merged
 

@@ -836,7 +836,7 @@ SPONSOR_SIMILARITY_THRESHOLD = 0.75  # Minimum similarity score to consider spon
 
 # Multiprocessing configuration
 USE_MULTIPROCESSING = True  # Set to False to use single-process mode
-NUM_WORKERS = None  # None = use all available CPU cores
+NUM_WORKERS = 192  # None = use all available CPU cores
 WORKER_CHUNK_SIZE = 1  # Episodes per worker task (1 = best for load balancing)
 
 
@@ -857,9 +857,10 @@ def worker_init():
     _worker_process_name = current_process().name
     print(f"  [{_worker_process_name}] Initializing worker...")
     
-    # Load GLiNER2 model (CPU-bound, ~1-2 seconds)
-    _worker_detector = AdDetector()
-    print(f"  [{_worker_process_name}] ✅ GLiNER2 model loaded")
+    # Load GLiNER2 model from local cache only (no network requests)
+    # The model must be pre-cached in the main process before spawning workers
+    _worker_detector = AdDetector(local_files_only=True)
+    print(f"  [{_worker_process_name}] ✅ GLiNER2 model loaded from cache")
     
     # Initialize Gemini model for this worker
     _worker_gemini_model = genai.GenerativeModel("gemini-2.5-pro")
@@ -2308,8 +2309,13 @@ def run_parallel_processing(episodes: list, writer: AsyncDBWriter) -> dict:
     
     start_time = time.time()
     
+    # Pre-cache the GLiNER2 model in the main process BEFORE spawning workers
+    # This prevents rate-limiting when multiple workers try to download simultaneously
+    print("\n📦 Pre-caching models before spawning workers...")
+    AdDetector.precache_model()
+    
     # Use Pool with worker initialization
-    # Each worker initializes its own model via worker_init()
+    # Each worker initializes its own model via worker_init() from local cache
     with Pool(
         processes=num_workers,
         initializer=worker_init,

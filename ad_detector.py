@@ -334,12 +334,46 @@ class AdDetector:
         re.IGNORECASE
     )
     
-    def __init__(self, model_name: str = "fastino/gliner2-base-v1"):
-        """Initialize the ad detector with GLiNER2 model"""
-        self.model = GLiNER2.from_pretrained(model_name)
+    # Default model name for GLiNER2
+    DEFAULT_MODEL_NAME = "fastino/gliner2-base-v1"
+    
+    def __init__(self, model_name: str = None, local_files_only: bool = False):
+        """
+        Initialize the ad detector with GLiNER2 model.
+        
+        Args:
+            model_name: HuggingFace model name or local path
+            local_files_only: If True, only load from local cache (no network requests).
+                             Use this in worker processes after pre-caching in main process.
+        """
+        model_name = model_name or self.DEFAULT_MODEL_NAME
+        self.model = GLiNER2.from_pretrained(model_name, local_files_only=local_files_only)
         # Keep backward compatibility
         self.extractor = self.model
         self.entity_labels = list(self.ENTITY_SCHEMA.keys())
+    
+    @classmethod
+    def precache_model(cls, model_name: str = None):
+        """
+        Pre-download and cache the model. Call this once in the main process
+        before spawning worker processes to avoid rate limiting.
+        
+        Args:
+            model_name: HuggingFace model name to cache
+            
+        Returns:
+            True if model was cached successfully
+        """
+        model_name = model_name or cls.DEFAULT_MODEL_NAME
+        print(f"📦 Pre-caching GLiNER2 model: {model_name}")
+        try:
+            # This downloads the model if not cached, or loads from cache if available
+            GLiNER2.from_pretrained(model_name)
+            print(f"✅ Model cached successfully: {model_name}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to cache model: {e}")
+            raise
     
     # =========================================================================
     # EXCLUSION DETECTION

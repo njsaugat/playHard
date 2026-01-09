@@ -346,8 +346,17 @@ class AdDetector:
             local_files_only: If True, only load from local cache (no network requests).
                              Use this in worker processes after pre-caching in main process.
         """
+        import os
+        
         model_name = model_name or self.DEFAULT_MODEL_NAME
-        self.model = GLiNER2.from_pretrained(model_name, local_files_only=local_files_only)
+        
+        # Force offline mode via environment variables if requested
+        # This ensures ALL HuggingFace libraries (transformers, tokenizers, etc.) use cache only
+        if local_files_only:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        
+        self.model = GLiNER2.from_pretrained(model_name)
         # Keep backward compatibility
         self.extractor = self.model
         self.entity_labels = list(self.ENTITY_SCHEMA.keys())
@@ -364,8 +373,15 @@ class AdDetector:
         Returns:
             True if model was cached successfully
         """
+        import os
+        
         model_name = model_name or cls.DEFAULT_MODEL_NAME
         print(f"📦 Pre-caching GLiNER2 model: {model_name}")
+        
+        # Ensure offline mode is OFF so we can download
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        
         try:
             # This downloads the model if not cached, or loads from cache if available
             GLiNER2.from_pretrained(model_name)

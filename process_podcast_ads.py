@@ -851,20 +851,30 @@ def worker_init():
     
     This loads the GLiNER2 model and Gemini model in each worker,
     ensuring true parallelism without shared state.
+    
+    IMPORTANT: If initialization fails, we exit the worker process
+    to prevent infinite respawn loops.
     """
     global _worker_detector, _worker_gemini_model, _worker_process_name
     
     _worker_process_name = current_process().name
     print(f"  [{_worker_process_name}] Initializing worker...")
     
-    # Load GLiNER2 model from local cache only (no network requests)
-    # The model must be pre-cached in the main process before spawning workers
-    _worker_detector = AdDetector(local_files_only=True)
-    print(f"  [{_worker_process_name}] ✅ GLiNER2 model loaded from cache")
-    
-    # Initialize Gemini model for this worker
-    _worker_gemini_model = genai.GenerativeModel("gemini-2.5-pro")
-    print(f"  [{_worker_process_name}] ✅ Gemini model ready")
+    try:
+        # Load GLiNER2 model from local cache only (no network requests)
+        # The model must be pre-cached in the main process before spawning workers
+        _worker_detector = AdDetector(local_files_only=True)
+        print(f"  [{_worker_process_name}] ✅ GLiNER2 model loaded from cache")
+        
+        # Initialize Gemini model for this worker
+        _worker_gemini_model = genai.GenerativeModel("gemini-2.5-pro")
+        print(f"  [{_worker_process_name}] ✅ Gemini model ready")
+    except Exception as e:
+        print(f"  [{_worker_process_name}] ❌ FATAL: Worker init failed: {e}")
+        print(f"  [{_worker_process_name}] ❌ Exiting worker to prevent respawn loop")
+        # Exit this worker process - don't let Pool respawn infinitely
+        import sys
+        sys.exit(1)
 
 
 def worker_process_episode(episode_data: dict) -> dict:
@@ -2314,11 +2324,17 @@ def run_parallel_processing(episodes: list, writer: AsyncDBWriter) -> dict:
     print("\n📦 Pre-caching models before spawning workers...")
     AdDetector.precache_model()
     
+    # Use 'spawn' start method to avoid fork issues (safer, no inherited state)
+    # This is especially important on Linux where 'fork' is default
+    ctx = multiprocessing.get_context('spawn')
+    
     # Use Pool with worker initialization
     # Each worker initializes its own model via worker_init() from local cache
-    with Pool(
+    # maxtasksperchild prevents infinite respawn if workers fail
+    with ctx.Pool(
         processes=num_workers,
         initializer=worker_init,
+        maxtasksperchild=100,  # Recycle workers after 100 tasks to prevent memory leaks
     ) as pool:
         
         # Use imap_unordered for better load balancing

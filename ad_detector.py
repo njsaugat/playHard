@@ -10,12 +10,24 @@ Built on GLiNER2 with multi-signal scoring using:
 - Brand love/shoutout detection
 """
 
+import os
 from gliner2 import GLiNER2
 import requests
 import re
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from enum import Enum
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Set HuggingFace token from environment if available
+# This authenticates API requests and bypasses rate limits
+_hf_token = os.getenv("HF_TOKEN")
+if _hf_token:
+    os.environ["HF_TOKEN"] = _hf_token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token  # Alternative env var name
 
 URL = "https://storage.googleapis.com/core-production-3c790.appspot.com/transcripts/RSS-6ff682d5-ae7d-44f0-88b8-b37b00575bbd-1762068399131.json"
 
@@ -374,13 +386,36 @@ class AdDetector:
             True if model was cached successfully
         """
         import os
+        from huggingface_hub import try_to_load_from_cache, scan_cache_dir
         
         model_name = model_name or cls.DEFAULT_MODEL_NAME
-        print(f"📦 Pre-caching GLiNER2 model: {model_name}")
+        print(f"📦 Checking GLiNER2 model cache: {model_name}")
+        
+        # Check if model is already cached by looking for key files
+        try:
+            config_path = try_to_load_from_cache(model_name, "config.json")
+            model_path = try_to_load_from_cache(model_name, "model.safetensors")
+            
+            if config_path is not None and model_path is not None:
+                print(f"✅ Model already cached locally - skipping download")
+                print(f"   Config: {config_path}")
+                print(f"   Model: {model_path}")
+                return True
+        except Exception as e:
+            print(f"   Cache check failed: {e}, will try to download")
         
         # Ensure offline mode is OFF so we can download
         os.environ.pop("HF_HUB_OFFLINE", None)
         os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        
+        # Check if HF token is available
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_token:
+            print(f"🔑 HuggingFace token found - authenticated download")
+        else:
+            print(f"⚠️  No HF_TOKEN found - using unauthenticated download (may be rate limited)")
+        
+        print(f"📥 Downloading model from HuggingFace: {model_name}")
         
         try:
             # This downloads the model if not cached, or loads from cache if available
@@ -388,6 +423,12 @@ class AdDetector:
             print(f"✅ Model cached successfully: {model_name}")
             return True
         except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "rate limit" in error_msg.lower():
+                print(f"⚠️  Rate limited by HuggingFace. Options:")
+                print(f"   1. Set HF_TOKEN environment variable with your HuggingFace token")
+                print(f"   2. Wait a few minutes and try again")
+                print(f"   3. Run: huggingface-cli login")
             print(f"❌ Failed to cache model: {e}")
             raise
     

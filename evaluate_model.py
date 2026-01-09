@@ -171,19 +171,32 @@ class ModelEvaluator:
             (predicted_label, confidence, raw_scores)
         """
         try:
-            result = self.model.classify(text, labels=self.labels)
+            # GLiNER2 uses schema-based extraction, not direct .classify()
+            schema = self.model.create_schema().classification(
+                "ad_detection",
+                ["ad", "no_ad"]
+            )
+            
+            # Extract with confidence scores
+            result = self.model.extract(text, schema, include_confidence=True)
             
             if isinstance(result, dict):
-                ad_score = result.get("ad", 0)
-                no_ad_score = result.get("no_ad", 0)
+                ad_detection = result.get("ad_detection", {})
                 
-                is_ad = ad_score > no_ad_score and ad_score >= self.threshold
+                # Handle both formats: {'label': 'ad', 'confidence': 0.9} or just 'ad'
+                if isinstance(ad_detection, dict):
+                    predicted = ad_detection.get("label", "no_ad")
+                    confidence = ad_detection.get("confidence", 0.5)
+                else:
+                    predicted = str(ad_detection) if ad_detection else "no_ad"
+                    confidence = 0.7
+                
+                is_ad = predicted == "ad" and confidence >= self.threshold
                 predicted = "ad" if is_ad else "no_ad"
-                confidence = ad_score if is_ad else no_ad_score
                 
-                return predicted, confidence, result
+                return predicted, confidence, {"ad_detection": ad_detection}
             else:
-                predicted = str(result).lower()
+                predicted = str(result).lower() if result else "no_ad"
                 return predicted, 0.7, {"raw": result}
                 
         except Exception as e:

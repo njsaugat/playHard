@@ -59,17 +59,28 @@ class TrainedAdClassifier:
             (is_ad: bool, confidence: float, label: str)
         """
         try:
-            result = self.model.classify(text, labels=self.labels)
+            # GLiNER2 uses schema-based extraction
+            schema = self.model.create_schema().classification(
+                "ad_detection",
+                ["ad", "no_ad"]
+            )
+            
+            result = self.model.extract(text, schema, include_confidence=True)
             
             if isinstance(result, dict):
-                ad_score = result.get("ad", 0)
-                no_ad_score = result.get("no_ad", 0)
+                ad_detection = result.get("ad_detection", {})
                 
-                is_ad = ad_score > no_ad_score and ad_score >= self.threshold
-                confidence = ad_score if is_ad else no_ad_score
-                label = "ad" if is_ad else "no_ad"
+                # Handle both formats: {'label': 'ad', 'confidence': 0.9} or just 'ad'
+                if isinstance(ad_detection, dict):
+                    label = ad_detection.get("label", "no_ad")
+                    confidence = ad_detection.get("confidence", 0.5)
+                else:
+                    label = str(ad_detection) if ad_detection else "no_ad"
+                    confidence = 0.7
                 
-                return is_ad, confidence, label
+                is_ad = label == "ad" and confidence >= self.threshold
+                
+                return is_ad, confidence, "ad" if is_ad else "no_ad"
             else:
                 # Fallback for string result
                 is_ad = str(result).lower() == "ad"
@@ -99,21 +110,34 @@ class TrainedAdClassifier:
         Get detailed classification result with all scores.
         """
         try:
-            result = self.model.classify(text, labels=self.labels)
+            # GLiNER2 uses schema-based extraction
+            schema = self.model.create_schema().classification(
+                "ad_detection",
+                ["ad", "no_ad"]
+            )
+            
+            result = self.model.extract(text, schema, include_confidence=True)
             
             if isinstance(result, dict):
-                ad_score = result.get("ad", 0)
-                no_ad_score = result.get("no_ad", 0)
-                is_ad = ad_score > no_ad_score and ad_score >= self.threshold
+                ad_detection = result.get("ad_detection", {})
+                
+                if isinstance(ad_detection, dict):
+                    label = ad_detection.get("label", "no_ad")
+                    confidence = ad_detection.get("confidence", 0.5)
+                else:
+                    label = str(ad_detection) if ad_detection else "no_ad"
+                    confidence = 0.7
+                
+                is_ad = label == "ad" and confidence >= self.threshold
                 
                 return {
                     "text_preview": text[:200] + "..." if len(text) > 200 else text,
                     "is_ad": is_ad,
                     "scores": {
-                        "ad": ad_score,
-                        "no_ad": no_ad_score
+                        "ad": confidence if label == "ad" else 1 - confidence,
+                        "no_ad": confidence if label == "no_ad" else 1 - confidence
                     },
-                    "confidence": max(ad_score, no_ad_score),
+                    "confidence": confidence,
                     "label": "ad" if is_ad else "no_ad",
                     "threshold": self.threshold
                 }

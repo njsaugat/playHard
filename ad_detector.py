@@ -515,32 +515,37 @@ class AdDetector:
         Descriptions help the model understand exactly what to look for.
         """
         try:
-            # Use entity extraction with descriptions for better accuracy
-            result = self.model.extract_entities(
-                text,
-                labels=self.ENTITY_SCHEMA,  # Pass dict with descriptions
-                threshold=0.3  # Lower threshold to catch more potential matches
-            )
+            # GLiNER2 uses schema-based extraction for NER
+            schema = self.model.create_schema()
             
-            if isinstance(result, dict) and "entities" in result:
-                return result["entities"]
-            elif isinstance(result, list):
-                # Convert list format to dict
+            # Add each entity type with description
+            for label, description in self.ENTITY_SCHEMA.items():
+                schema = schema.ner(label, description)
+            
+            result = self.model.extract(text, schema, include_confidence=True)
+            
+            if isinstance(result, dict):
+                # Convert to expected format: {label: [text1, text2, ...]}
                 entities = {}
-                for ent in result:
-                    label = ent.get("label", "unknown")
-                    if label not in entities:
-                        entities[label] = []
-                    entities[label].append(ent.get("text", ""))
+                for label in self.ENTITY_SCHEMA.keys():
+                    label_results = result.get(label, [])
+                    if isinstance(label_results, list):
+                        # Extract text from each entity
+                        texts = []
+                        for item in label_results:
+                            if isinstance(item, dict):
+                                texts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                texts.append(item)
+                        if texts:
+                            entities[label] = texts
+                    elif label_results:
+                        entities[label] = [str(label_results)]
                 return entities
+                
         except Exception as e:
-            # Fallback to basic extraction
-            try:
-                result = self.model.extract_entities(text, list(self.ENTITY_SCHEMA.keys()))
-                if isinstance(result, dict) and "entities" in result:
-                    return result["entities"]
-            except:
-                pass
+            # Entity extraction not available
+            pass
         return {}
     
     # =========================================================================
@@ -553,24 +558,26 @@ class AdDetector:
         Returns (is_ad: bool, confidence: float)
         """
         try:
-            # Single-label classification with descriptions
-            result = self.model.classify(
-                text,
-                labels=self.CLASSIFICATION_LABELS,
+            # GLiNER2 uses schema-based extraction for classification
+            schema = self.model.create_schema().classification(
+                "ad_classification",
+                ["advertisement", "regular_content"]
             )
             
+            result = self.model.extract(text, schema, include_confidence=True)
+            
             if isinstance(result, dict):
-                # Check if "advertisement" has higher score
-                ad_score = result.get("advertisement", 0)
-                regular_score = result.get("regular_content", 0)
+                ad_classification = result.get("ad_classification", {})
                 
-                is_ad = ad_score > regular_score
-                confidence = ad_score if is_ad else (1 - regular_score)
-                return is_ad, confidence
-            elif isinstance(result, str):
-                # Label-only result
-                is_ad = result == "advertisement"
-                return is_ad, 0.7 if is_ad else 0.3
+                if isinstance(ad_classification, dict):
+                    label = ad_classification.get("label", "regular_content")
+                    confidence = ad_classification.get("confidence", 0.5)
+                    is_ad = label == "advertisement"
+                    return is_ad, confidence
+                else:
+                    # String result
+                    is_ad = str(ad_classification) == "advertisement"
+                    return is_ad, 0.7 if is_ad else 0.3
                 
         except Exception as e:
             # Classification not available, return neutral
@@ -588,14 +595,17 @@ class AdDetector:
         This is more efficient than multiple separate extractions.
         """
         try:
-            result = self.model.extract_json(
-                text,
-                schema=self.AD_JSON_SCHEMA,
-            )
+            # GLiNER2 uses schema-based extraction for JSON
+            schema = self.model.create_schema().json(self.AD_JSON_SCHEMA)
+            
+            result = self.model.extract(text, schema)
             
             if isinstance(result, dict):
-                # Clean up empty values
-                return {k: v for k, v in result.items() if v}
+                # The result might be nested under 'json' key or directly available
+                json_result = result.get("json", result)
+                if isinstance(json_result, dict):
+                    # Clean up empty values
+                    return {k: v for k, v in json_result.items() if v}
                 
         except Exception as e:
             # JSON extraction not available
@@ -622,13 +632,22 @@ class AdDetector:
                         all_entities.append({"text": item, "label": label})
             
             if len(all_entities) >= 2:
-                result = self.model.extract_relations(
-                    text,
-                    entities=all_entities,
-                    relation_types=self.RELATION_TYPES,
-                )
+                # GLiNER2 uses schema-based extraction for relations
+                schema = self.model.create_schema()
                 
-                if isinstance(result, list):
+                # Add relation types
+                for rel_type in self.RELATION_TYPES:
+                    schema = schema.relation(rel_type)
+                
+                result = self.model.extract(text, schema)
+                
+                if isinstance(result, dict):
+                    # Collect relations from result
+                    for rel_type in self.RELATION_TYPES:
+                        rel_results = result.get(rel_type, [])
+                        if isinstance(rel_results, list):
+                            relations.extend(rel_results)
+                elif isinstance(result, list):
                     relations = result
                     
         except Exception as e:
@@ -654,42 +673,56 @@ class AdDetector:
         }
         
         try:
-            # Build combined schema
-            combined_schema = {
-                "classification": {
-                    "labels": self.CLASSIFICATION_LABELS,
-                    "multi_label": False
-                },
-                "entities": {
-                    "labels": self.ENTITY_SCHEMA
-                },
-                "json": self.AD_JSON_SCHEMA
-            }
+            # Build combined schema using chained builder
+            schema = self.model.create_schema()
             
-            result = self.model.extract(
-                text,
-                schema=combined_schema,
+            # Add classification
+            schema = schema.classification(
+                "ad_classification",
+                ["advertisement", "regular_content"]
             )
+            
+            # Add entity extraction for each type
+            for label, description in self.ENTITY_SCHEMA.items():
+                schema = schema.ner(label, description)
+            
+            # Add JSON extraction
+            schema = schema.json(self.AD_JSON_SCHEMA)
+            
+            result = self.model.extract(text, schema, include_confidence=True)
             
             if isinstance(result, dict):
                 # Parse classification result
-                if "classification" in result:
-                    cls_result = result["classification"]
-                    if isinstance(cls_result, dict):
-                        ad_score = cls_result.get("advertisement", 0)
-                        combined_result["classification"] = {
-                            "is_ad": ad_score > 0.5,
-                            "confidence": ad_score
-                        }
+                ad_classification = result.get("ad_classification", {})
+                if isinstance(ad_classification, dict):
+                    label = ad_classification.get("label", "regular_content")
+                    confidence = ad_classification.get("confidence", 0.5)
+                    combined_result["classification"] = {
+                        "is_ad": label == "advertisement",
+                        "confidence": confidence
+                    }
                 
                 # Parse entities
-                if "entities" in result:
-                    combined_result["entities"] = result["entities"]
+                for label in self.ENTITY_SCHEMA.keys():
+                    label_results = result.get(label, [])
+                    if label_results:
+                        if isinstance(label_results, list):
+                            texts = []
+                            for item in label_results:
+                                if isinstance(item, dict):
+                                    texts.append(item.get("text", ""))
+                                elif isinstance(item, str):
+                                    texts.append(item)
+                            if texts:
+                                combined_result["entities"][label] = texts
+                        else:
+                            combined_result["entities"][label] = [str(label_results)]
                 
                 # Parse JSON structure
-                if "json" in result:
+                json_result = result.get("json", {})
+                if isinstance(json_result, dict):
                     combined_result["structured"] = {
-                        k: v for k, v in result["json"].items() if v
+                        k: v for k, v in json_result.items() if v
                     }
                     
         except Exception as e:

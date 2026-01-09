@@ -303,20 +303,30 @@ def evaluate_model(model_path: str, test_path: str) -> Dict:
     
     print(f"\n🔍 Running predictions on {len(test_data)} examples...")
     
+    # Create classification schema once
+    schema = model.create_schema().classification(
+        "ad_detection",
+        ["ad", "no_ad"]
+    )
+    
     for i, record in enumerate(test_data):
         text = record['input']
         true_labels = record['output']['classifications'][0]['true_label']
         true_label = true_labels[0] if true_labels else "no_ad"
         
         try:
-            # Classify using the trained model
-            result = model.classify(text, labels=labels)
+            # Classify using schema-based extraction
+            result = model.extract(text, schema, include_confidence=True)
             
             if isinstance(result, dict):
-                # Get the label with highest score
-                pred_label = max(result, key=result.get)
+                ad_detection = result.get("ad_detection", {})
+                
+                if isinstance(ad_detection, dict):
+                    pred_label = ad_detection.get("label", "no_ad")
+                else:
+                    pred_label = str(ad_detection) if ad_detection else "no_ad"
             else:
-                pred_label = str(result)
+                pred_label = str(result) if result else "no_ad"
         except Exception as e:
             print(f"  ⚠️ Error on example {i}: {e}")
             pred_label = "no_ad"

@@ -36,6 +36,20 @@ import atexit
 from contextlib import contextmanager
 import difflib
 
+# Multiprocessing for true parallelism (bypasses GIL)
+from multiprocessing import Pool, cpu_count, Manager, current_process
+import multiprocessing
+
+# =============================================================================
+# MULTIPROCESSING WORKER STATE
+# =============================================================================
+# Each worker process gets its own detector and Gemini model instance.
+# These are initialized once per process via worker_init().
+
+_worker_detector: Optional[AdDetector] = None
+_worker_gemini_model = None
+_worker_process_name: str = ""
+
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
@@ -819,6 +833,317 @@ BRAND_LOVE_CONFIDENCE = 0.20  # Very low confidence for brand love
 # Deduplication: Skip ads from the same sponsor within this time window (seconds)
 AD_DEDUP_WINDOW_SECONDS = 300  # 5 minutes
 SPONSOR_SIMILARITY_THRESHOLD = 0.75  # Minimum similarity score to consider sponsors as same
+
+# Multiprocessing configuration
+USE_MULTIPROCESSING = True  # Set to False to use single-process mode
+NUM_WORKERS = None  # None = use all available CPU cores
+WORKER_CHUNK_SIZE = 1  # Episodes per worker task (1 = best for load balancing)
+
+
+# =============================================================================
+# MULTIPROCESSING WORKER FUNCTIONS
+# =============================================================================
+
+def worker_init():
+    """
+    Initialize worker process with its own model instances.
+    Called once when each worker process starts.
+    
+    This loads the GLiNER2 model and Gemini model in each worker,
+    ensuring true parallelism without shared state.
+    """
+    global _worker_detector, _worker_gemini_model, _worker_process_name
+    
+    _worker_process_name = current_process().name
+    print(f"  [{_worker_process_name}] Initializing worker...")
+    
+    # Load GLiNER2 model (CPU-bound, ~1-2 seconds)
+    _worker_detector = AdDetector()
+    print(f"  [{_worker_process_name}] ✅ GLiNER2 model loaded")
+    
+    # Initialize Gemini model for this worker
+    _worker_gemini_model = genai.GenerativeModel("gemini-2.5-pro")
+    print(f"  [{_worker_process_name}] ✅ Gemini model ready")
+
+
+def worker_process_episode(episode_data: dict) -> dict:
+    """
+    Worker function to process a single episode.
+    Runs in a separate process with its own model instances.
+    
+    Args:
+        episode_data: Dict with 'episodeId' and 'transcriptUrl'
+    
+    Returns:
+        Dict with processing results and ad events to emit
+    """
+    global _worker_detector, _worker_gemini_model, _worker_process_name
+    
+    episode_id = episode_data['episodeId']
+    transcript_url = episode_data['transcriptUrl']
+    
+    result = {
+        "episode_id": episode_id,
+        "process_name": _worker_process_name,
+        "detected": 0,
+        "emitted": 0,
+        "excluded": 0,
+        "brand_love": 0,
+        "duplicates": 0,
+        "ad_events": [],  # List of ad events to emit
+        "error": None,
+    }
+    
+    try:
+        # Fetch transcript
+        transcript_data = fetch_transcript(transcript_url)
+        if not transcript_data:
+            result["error"] = "Failed to fetch transcript"
+            return result
+        
+        # Detect ads using worker's GLiNER2 detector (CPU-bound)
+        ads = _worker_detector.detect_ads(
+            transcript_data,
+            min_confidence=AdConfidence.MEDIUM,
+            merge_adjacent=True,
+            merge_gap_seconds=10.0,
+            quick_filter=True,
+        )
+        
+        if not ads:
+            return result
+        
+        result["detected"] = len(ads)
+        
+        # Track recently processed ads for deduplication
+        recent_ads = {}
+        
+        for ad in ads:
+            # Check if excluded by GLiNER2
+            if ad.excluded:
+                result["excluded"] += 1
+                continue
+            
+            # Check if GLiNER2 detected brand love
+            if ad.is_brand_love:
+                ad_content = build_brand_love_content(ad, source="gliner")
+                if ad_content["sponsorName"] != "Unknown Brand":
+                    ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                    result["ad_events"].append({
+                        "episode_id": episode_id,
+                        "ad_segment": {
+                            "start_time": ad.start_time,
+                            "end_time": ad.end_time,
+                            "confidence_score": ad.confidence_score,
+                        },
+                        "ad_content": ad_content,
+                        "is_brand_love": True,
+                    })
+                    result["brand_love"] += 1
+                continue
+            
+            # Check if partial ad - needs context expansion
+            is_partial = ad.signals.get("is_partial", False)
+            if is_partial:
+                expanded_ad = _worker_detector.reanalyze_with_expanded_context(
+                    transcript_data, ad, context_segments=1
+                )
+                if expanded_ad.context_expanded:
+                    if expanded_ad.excluded:
+                        result["excluded"] += 1
+                        continue
+                    if expanded_ad.is_brand_love:
+                        ad_content = build_brand_love_content(expanded_ad, source="gliner")
+                        if ad_content["sponsorName"] != "Unknown Brand":
+                            expanded_ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                            result["ad_events"].append({
+                                "episode_id": episode_id,
+                                "ad_segment": {
+                                    "start_time": expanded_ad.start_time,
+                                    "end_time": expanded_ad.end_time,
+                                    "confidence_score": expanded_ad.confidence_score,
+                                },
+                                "ad_content": ad_content,
+                                "is_brand_love": True,
+                            })
+                            result["brand_love"] += 1
+                        continue
+                    ad = expanded_ad
+            
+            # Decide if we need Gemini verification
+            skip_llm = (
+                ad.confidence_score >= HIGH_CONFIDENCE_THRESHOLD and
+                ad.is_ad_classification is True and
+                ad.classification_confidence >= 0.8 and
+                ad.structured_data.get("sponsor_name") and
+                (ad.structured_data.get("sponsor_url") or ad.structured_data.get("promo_code"))
+            )
+            
+            if skip_llm:
+                llm_result = {
+                    "is_ad": True,
+                    "is_brand_love": False,
+                    "confidence": ad.classification_confidence,
+                    "sponsor": ad.structured_data.get("sponsor_name"),
+                    "sponsor_url": ad.structured_data.get("sponsor_url"),
+                    "promo_code": ad.structured_data.get("promo_code"),
+                    "discount_offer": ad.structured_data.get("discount_offer"),
+                }
+                combined_score = ad.confidence_score
+            else:
+                # Get context for Gemini (uses worker's model)
+                context_text = get_context_text(transcript_data, ad.start_time, ad.end_time)
+                llm_result = verify_ad_with_gemini(context_text, ad.structured_data)
+                
+                # Check for brand love from Gemini
+                if llm_result.get("is_brand_love"):
+                    ad_content = build_brand_love_content(ad, source="gemini", reason=llm_result.get("brand_love_reason"))
+                    if ad_content["sponsorName"] != "Unknown Brand":
+                        ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                        result["ad_events"].append({
+                            "episode_id": episode_id,
+                            "ad_segment": {
+                                "start_time": ad.start_time,
+                                "end_time": ad.end_time,
+                                "confidence_score": ad.confidence_score,
+                            },
+                            "ad_content": ad_content,
+                            "is_brand_love": True,
+                        })
+                        result["brand_love"] += 1
+                    continue
+                
+                if llm_result["confidence"] == 0 and not llm_result["is_ad"]:
+                    combined_score = ad.confidence_score * 0.5
+                elif not llm_result["is_ad"]:
+                    if ad.is_ad_classification and ad.classification_confidence > 0.7:
+                        combined_score = (
+                            ad.confidence_score * MODEL_WEIGHT +
+                            ad.classification_confidence * GLINER_CLASSIFICATION_WEIGHT
+                        )
+                    else:
+                        continue
+                else:
+                    if ad.is_ad_classification is not None:
+                        combined_score = (
+                            llm_result["confidence"] * LLM_WEIGHT +
+                            ad.confidence_score * MODEL_WEIGHT +
+                            ad.classification_confidence * GLINER_CLASSIFICATION_WEIGHT
+                        )
+                    else:
+                        combined_score = (
+                            llm_result["confidence"] * (LLM_WEIGHT + GLINER_CLASSIFICATION_WEIGHT) +
+                            ad.confidence_score * MODEL_WEIGHT
+                        )
+            
+            # Check threshold
+            if combined_score < MIN_CONFIDENCE_TO_SAVE:
+                continue
+            
+            # Build ad content
+            ad_content = build_ad_content(ad, llm_result, combined_score)
+            sponsor_name = ad_content["sponsorName"]
+            
+            # Deduplication check
+            normalized_sponsor = sponsor_name.lower().strip() if sponsor_name else ""
+            similar_match = find_similar_sponsor(sponsor_name, recent_ads)
+            if similar_match:
+                matched_sponsor, last_end_time = similar_match
+                time_since_last = ad.start_time - last_end_time
+                if 0 < time_since_last < AD_DEDUP_WINDOW_SECONDS:
+                    result["duplicates"] += 1
+                    continue
+            
+            # Add to events list
+            result["ad_events"].append({
+                "episode_id": episode_id,
+                "ad_segment": {
+                    "start_time": ad.start_time,
+                    "end_time": ad.end_time,
+                    "confidence_score": combined_score,
+                },
+                "ad_content": ad_content,
+                "is_brand_love": False,
+            })
+            result["emitted"] += 1
+            
+            if normalized_sponsor and normalized_sponsor != "unknown brand":
+                recent_ads[normalized_sponsor] = ad.end_time
+            
+            # Handle multi-ad detection
+            likely_multiple = llm_result.get("likely_multiple_ads", False)
+            other_sponsors_hint = llm_result.get("other_sponsors_hint") or []
+            
+            if likely_multiple and other_sponsors_hint:
+                processed_hints = {normalized_sponsor}
+                EXPANDED_CONTEXT_SECONDS = 60
+                expanded_context_text = get_context_text(
+                    transcript_data, ad.start_time, ad.end_time,
+                    context_seconds=EXPANDED_CONTEXT_SECONDS
+                )
+                expanded_analysis = _worker_detector.analyze_segment(
+                    expanded_context_text,
+                    ad.start_time - EXPANDED_CONTEXT_SECONDS,
+                    ad.end_time + EXPANDED_CONTEXT_SECONDS,
+                    use_combined=True,
+                    skip_exclusion_check=True
+                )
+                
+                for hint_sponsor in other_sponsors_hint:
+                    hint_normalized = hint_sponsor.lower().strip()
+                    if are_sponsors_similar(hint_normalized, normalized_sponsor):
+                        continue
+                    if any(are_sponsors_similar(hint_normalized, p) for p in processed_hints):
+                        continue
+                    
+                    similar_match = find_similar_sponsor(hint_sponsor, recent_ads)
+                    if similar_match:
+                        matched_sponsor, last_end_time = similar_match
+                        if 0 < ad.start_time - last_end_time < AD_DEDUP_WINDOW_SECONDS:
+                            result["duplicates"] += 1
+                            processed_hints.add(hint_normalized)
+                            continue
+                    
+                    additional_ad_content = build_additional_ad_content(
+                        hint_sponsor, ad, ad_content, expanded_analysis,
+                        combined_score * 0.9
+                    )
+                    
+                    if additional_ad_content:
+                        result["ad_events"].append({
+                            "episode_id": episode_id,
+                            "ad_segment": {
+                                "start_time": ad.start_time,
+                                "end_time": ad.end_time,
+                                "confidence_score": additional_ad_content["combinedConfidence"],
+                            },
+                            "ad_content": additional_ad_content,
+                            "is_brand_love": False,
+                        })
+                        result["emitted"] += 1
+                        if hint_normalized != "unknown brand":
+                            recent_ads[hint_normalized] = ad.end_time
+                    
+                    processed_hints.add(hint_normalized)
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return result
+
+
+def get_optimal_worker_count() -> int:
+    """
+    Get optimal number of worker processes.
+    Uses all available CPU cores minus 1 (for main process overhead).
+    """
+    if NUM_WORKERS is not None:
+        return NUM_WORKERS
+    
+    cores = cpu_count()
+    # Leave 1 core for main process and OS overhead
+    optimal = max(1, cores - 1)
+    return optimal
 
 
 def are_sponsors_similar(sponsor1: str, sponsor2: str, threshold: float = SPONSOR_SIMILARITY_THRESHOLD) -> bool:
@@ -1941,12 +2266,187 @@ def process_episode(
     }
 
 
+def run_parallel_processing(episodes: list, writer: AsyncDBWriter) -> dict:
+    """
+    Process episodes in parallel using multiprocessing Pool.
+    
+    Each worker process has its own GLiNER2 and Gemini model instances.
+    Results are collected and written to DB from the main process.
+    
+    Args:
+        episodes: List of episode dicts with 'episodeId' and 'transcriptUrl'
+        writer: AsyncDBWriter instance for database writes
+    
+    Returns:
+        Dict with aggregated statistics
+    """
+    num_workers = get_optimal_worker_count()
+    total_episodes = len(episodes)
+    
+    print(f"\n🚀 Starting parallel processing with {num_workers} worker processes")
+    print(f"   Total CPU cores: {cpu_count()}")
+    print(f"   Episodes to process: {total_episodes}")
+    print("=" * 70)
+    
+    # Create emitter for main process
+    emitter = AdEventEmitter(writer)
+    
+    # Statistics
+    stats = {
+        "detected": 0,
+        "emitted": 0,
+        "excluded": 0,
+        "brand_love": 0,
+        "duplicates": 0,
+        "episodes_processed": 0,
+        "episodes_with_ads": 0,
+        "errors": 0,
+    }
+    
+    # Convert episodes to list of dicts for multiprocessing
+    episode_dicts = [dict(ep) for ep in episodes]
+    
+    start_time = time.time()
+    
+    # Use Pool with worker initialization
+    # Each worker initializes its own model via worker_init()
+    with Pool(
+        processes=num_workers,
+        initializer=worker_init,
+    ) as pool:
+        
+        # Use imap_unordered for better load balancing
+        # Results come back as soon as any worker finishes
+        results_iter = pool.imap_unordered(
+            worker_process_episode,
+            episode_dicts,
+            chunksize=WORKER_CHUNK_SIZE,
+        )
+        
+        # Process results as they arrive
+        for i, result in enumerate(results_iter, 1):
+            stats["episodes_processed"] += 1
+            
+            if result.get("error"):
+                stats["errors"] += 1
+                print(f"  [{result.get('process_name', '?')}] ❌ Episode {result['episode_id'][:8]}...: {result['error']}")
+                continue
+            
+            # Update statistics
+            stats["detected"] += result["detected"]
+            stats["excluded"] += result["excluded"]
+            stats["brand_love"] += result["brand_love"]
+            stats["duplicates"] += result["duplicates"]
+            
+            # Emit ad events to the async writer
+            ad_events = result.get("ad_events", [])
+            events_emitted = 0
+            
+            for event_data in ad_events:
+                # Create a simple AdSegment-like object for emitter
+                class SimpleAdSegment:
+                    def __init__(self, data):
+                        self.start_time = data["start_time"]
+                        self.end_time = data["end_time"]
+                        self.confidence_score = data["confidence_score"]
+                
+                ad_segment = SimpleAdSegment(event_data["ad_segment"])
+                
+                if emitter.emit_ad(
+                    event_data["episode_id"],
+                    ad_segment,
+                    event_data["ad_content"],
+                    is_brand_love=event_data["is_brand_love"],
+                ):
+                    events_emitted += 1
+            
+            stats["emitted"] += events_emitted
+            
+            if events_emitted > 0:
+                stats["episodes_with_ads"] += 1
+            
+            # Progress logging
+            if i % 10 == 0 or i == total_episodes:
+                elapsed = time.time() - start_time
+                eps_per_sec = i / elapsed if elapsed > 0 else 0
+                writer_stats = writer.get_stats()
+                print(f"\n  📊 Progress: {i}/{total_episodes} ({i/total_episodes*100:.1f}%) | "
+                      f"{eps_per_sec:.2f} eps/sec | "
+                      f"Written: {writer_stats['events_written']}")
+    
+    elapsed_total = time.time() - start_time
+    print(f"\n  ⏱️ Parallel processing completed in {elapsed_total:.1f}s")
+    print(f"     Throughput: {total_episodes/elapsed_total:.2f} episodes/second")
+    
+    return stats
+
+
+def run_single_process(episodes: list, writer: AsyncDBWriter) -> dict:
+    """
+    Process episodes sequentially in single process mode.
+    Original implementation - used as fallback.
+    """
+    print("\n📦 Loading ad detection model (GLiNER2 with full capabilities)...")
+    detector = AdDetector()
+    
+    emitter = AdEventEmitter(writer)
+    
+    stats = {
+        "detected": 0,
+        "emitted": 0,
+        "excluded": 0,
+        "brand_love": 0,
+        "duplicates": 0,
+        "episodes_processed": 0,
+        "episodes_with_ads": 0,
+        "errors": 0,
+    }
+    
+    for episode in episodes:
+        episode_id = episode['episodeId']
+        transcript_url = episode['transcriptUrl']
+        
+        try:
+            result = process_episode(
+                detector,
+                emitter,
+                episode_id,
+                transcript_url,
+            )
+            
+            stats["detected"] += result["detected"]
+            stats["emitted"] += result["emitted"]
+            stats["excluded"] += result["excluded"]
+            stats["brand_love"] += result["brand_love"]
+            stats["duplicates"] += result["duplicates"]
+            
+            if result["emitted"] > 0:
+                stats["episodes_with_ads"] += 1
+            
+            stats["episodes_processed"] += 1
+            
+            if stats["episodes_processed"] % 10 == 0:
+                writer_stats = writer.get_stats()
+                print(f"\n  📊 Writer stats: {writer_stats['events_written']}/{writer_stats['events_received']} written, "
+                      f"{writer_stats['batches_written']} batches")
+            
+        except Exception as e:
+            print(f"  ❌ Error processing episode {episode_id}: {e}")
+            stats["errors"] += 1
+            continue
+    
+    return stats
+
+
 def main():
-    """Main execution function"""
+    """Main execution function with multiprocessing support"""
     print("=" * 70)
     print("🎙️  Podcast Ad Detection Pipeline")
     print("   Powered by GLiNER2 + Gemini Verification")
-    print("   Architecture: Event-driven with async batched DB writes")
+    if USE_MULTIPROCESSING:
+        print(f"   Architecture: MULTIPROCESSING with {get_optimal_worker_count()} workers")
+    else:
+        print("   Architecture: Event-driven with async batched DB writes")
     print("=" * 70)
     print(f"   LLM Weight: {LLM_WEIGHT:.0%} | Model Weight: {MODEL_WEIGHT:.0%} | GLiNER Class: {GLINER_CLASSIFICATION_WEIGHT:.0%}")
     print(f"   Min Confidence: {MIN_CONFIDENCE_TO_SAVE:.0%}")
@@ -1958,6 +2458,11 @@ def main():
     print(f"   Flush Interval: {FLUSH_INTERVAL_SECONDS}s")
     print(f"   Max Queue Size: {MAX_QUEUE_SIZE}")
     print("=" * 70)
+    if USE_MULTIPROCESSING:
+        print("\n🔧 Multiprocessing Configuration:")
+        print(f"   Workers: {get_optimal_worker_count()} processes")
+        print(f"   Chunk Size: {WORKER_CHUNK_SIZE} episode(s) per task")
+        print("=" * 70)
     print("\n📋 Exclusion Filters Active:")
     print("   • Patreon/Substack/GoFundMe/BuyMeACoffee/PayPal (creator support)")
     print("   • Social media plugs (self-promotion)")
@@ -1965,10 +2470,7 @@ def main():
     print("   • Brand love/shoutouts (no commercial intent)")
     print("=" * 70)
     
-    print("\n📦 Loading ad detection model (GLiNER2 with full capabilities)...")
-    detector = AdDetector()
-    
-    print("🔌 Initializing async database writer...")
+    print("\n🔌 Initializing async database writer...")
     writer = AsyncDBWriter(
         database_url=DATABASE_URL,
         batch_size=BATCH_SIZE,
@@ -1976,9 +2478,6 @@ def main():
         max_queue_size=MAX_QUEUE_SIZE,
     )
     writer.start()
-    
-    # Create event emitter for this processing session
-    emitter = AdEventEmitter(writer)
     
     print("🔌 Connecting to database for episode fetching...")
     conn = get_db_connection()
@@ -1993,48 +2492,11 @@ def main():
             print("No episodes found matching criteria.")
             return
         
-        total_detected = 0
-        total_emitted = 0
-        total_excluded = 0
-        total_brand_love = 0
-        total_duplicates = 0
-        episodes_processed = 0
-        episodes_with_ads = 0
-        
-        for episode in episodes:
-            episode_id = episode['episodeId']
-            transcript_url = episode['transcriptUrl']
-            
-            try:
-                # Process episode - ML inference is CPU-bound
-                # DB writes happen asynchronously via the queue
-                result = process_episode(
-                    detector,
-                    emitter,
-                    episode_id,
-                    transcript_url,
-                )
-                
-                total_detected += result["detected"]
-                total_emitted += result["emitted"]
-                total_excluded += result["excluded"]
-                total_brand_love += result["brand_love"]
-                total_duplicates += result["duplicates"]
-                
-                if result["emitted"] > 0:
-                    episodes_with_ads += 1
-                
-                episodes_processed += 1
-                
-                # Periodically log writer stats
-                if episodes_processed % 10 == 0:
-                    stats = writer.get_stats()
-                    print(f"\n  📊 Writer stats: {stats['events_written']}/{stats['events_received']} written, "
-                          f"{stats['batches_written']} batches")
-                
-            except Exception as e:
-                print(f"  ❌ Error processing episode {episode_id}: {e}")
-                continue
+        # Choose processing mode
+        if USE_MULTIPROCESSING and len(episodes) > 1:
+            stats = run_parallel_processing(episodes, writer)
+        else:
+            stats = run_single_process(episodes, writer)
         
         # Final flush - ensure all events are written
         print("\n💾 Flushing remaining events...")
@@ -2047,18 +2509,22 @@ def main():
         print("\n" + "=" * 70)
         print("📊 SUMMARY")
         print("=" * 70)
-        print(f"   Episodes processed:  {episodes_processed}")
-        print(f"   Episodes with ads:   {episodes_with_ads}")
-        print(f"   Ads detected:        {total_detected}")
-        print(f"   Events emitted:      {total_emitted}")
+        print(f"   Processing mode:     {'PARALLEL' if USE_MULTIPROCESSING else 'SINGLE'}")
+        if USE_MULTIPROCESSING:
+            print(f"   Worker processes:    {get_optimal_worker_count()}")
+        print(f"   Episodes processed:  {stats['episodes_processed']}")
+        print(f"   Episodes with ads:   {stats['episodes_with_ads']}")
+        print(f"   Ads detected:        {stats['detected']}")
+        print(f"   Events emitted:      {stats['emitted']}")
         print(f"   Events written:      {writer_stats['events_written']}")
         print(f"   Batches written:     {writer_stats['batches_written']}")
         print(f"   Write errors:        {writer_stats['errors']}")
-        print(f"   Excluded:            {total_excluded}")
-        print(f"   Brand endorsements:  {total_brand_love}")
-        print(f"   Duplicates skipped:  {total_duplicates}")
-        if total_detected > 0:
-            print(f"   Filter rate:         {(1 - total_emitted/total_detected)*100:.1f}% noise removed")
+        print(f"   Processing errors:   {stats['errors']}")
+        print(f"   Excluded:            {stats['excluded']}")
+        print(f"   Brand endorsements:  {stats['brand_love']}")
+        print(f"   Duplicates skipped:  {stats['duplicates']}")
+        if stats["detected"] > 0:
+            print(f"   Filter rate:         {(1 - stats['emitted']/stats['detected'])*100:.1f}% noise removed")
         print("=" * 70)
         print("✅ Pipeline complete!")
         

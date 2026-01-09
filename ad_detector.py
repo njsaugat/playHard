@@ -86,7 +86,7 @@ class AdDetector:
     # EXCLUSION PATTERNS - Things that are NEVER ads
     # =========================================================================
     
-    # Patreon/Substack patterns (creator support, not sponsor ads)
+    # Patreon/Substack/Crowdfunding patterns (creator support, not sponsor ads)
     PATREON_SUBSTACK_PATTERNS = [
         r'\bpatreon\.com\b',
         r'\bpatreon\b',
@@ -99,7 +99,13 @@ class AdDetector:
         r'\bpatreon\s+supporters?\b',
         r'\bpatreon\s+members?\b',
         r'\bko-?fi\b',
-        r'\bbuy\s+me\s+a\s+coffee\b',
+        r'\bbuy\s*me\s*a\s*coffee\b',
+        r'\bbuymeacoffee\.com\b',
+        r'\bgofundme\.com\b',
+        r'\bgofundme\b',
+        r'\bgo\s*fund\s*me\b',
+        r'\bpaypal\.me\b',
+        r'\bdonate\s+(?:to\s+)?(?:us|me|the\s+show)\b',
     ]
     
     # Social media plug patterns (self-promotion, not sponsor ads)

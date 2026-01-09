@@ -3,6 +3,11 @@ Podcast Ad Detection Pipeline
 Fetches episodes from database, runs ad detection, and saves results.
 Uses GLiNER2's structured extraction + Gemini for verification.
 
+Architecture: Event-driven with async batched DB writes
+- ML inference emits events to an in-memory queue
+- Background thread consumes events and batches DB writes
+- Decouples CPU-bound model work from I/O-bound database operations
+
 Key features:
 - Exclusion filters: Patreon, Substack, social media plugs, ad-free subscriptions
 - Brand love detection: Low confidence for shoutouts without CTAs
@@ -16,14 +21,555 @@ import uuid
 import re
 import requests
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extras import RealDictCursor, Json, execute_batch
 from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 from ad_detector import AdDetector, AdConfidence, format_timestamp, ExclusionReason
+from dataclasses import dataclass, field
+from typing import Optional, Any, Callable
+from enum import Enum
+import threading
+import queue
+import time
+import atexit
+from contextlib import contextmanager
+import difflib
 
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+
+# =============================================================================
+# EVENT SYSTEM - Decouples ML inference from DB writes
+# =============================================================================
+
+class EventType(Enum):
+    """Types of events that can be emitted by the processing pipeline"""
+    AD_DETECTED = "ad_detected"
+    BRAND_LOVE_DETECTED = "brand_love_detected"
+    SHUTDOWN = "shutdown"
+    FLUSH = "flush"
+
+
+@dataclass
+class AdEvent:
+    """
+    Event emitted when an ad is detected.
+    Contains all data needed to persist to database.
+    """
+    event_type: EventType
+    episode_id: str
+    sponsor_name: str
+    sponsor_url: str
+    start_time: int
+    end_time: int
+    confidence_score: float
+    ad_content: dict
+    product_name: str = ""
+    ad_type: str = "HOST_READ"
+    ad_format: str = "UNCLASSIFIED"
+    is_brand_love: bool = False
+    timestamp: float = field(default_factory=time.time)
+    
+    def __post_init__(self):
+        # Ensure times are integers
+        self.start_time = int(self.start_time)
+        self.end_time = int(self.end_time)
+        self.confidence_score = round(self.confidence_score, 4)
+
+
+@dataclass
+class ShutdownEvent:
+    """Signal to shutdown the writer thread"""
+    event_type: EventType = EventType.SHUTDOWN
+
+
+@dataclass
+class FlushEvent:
+    """Signal to flush pending writes immediately"""
+    event_type: EventType = EventType.FLUSH
+    wait_event: threading.Event = field(default_factory=threading.Event)
+
+
+# =============================================================================
+# ASYNC DATABASE WRITER - Background thread for batched writes
+# =============================================================================
+
+class AsyncDBWriter:
+    """
+    Asynchronous database writer with batched operations.
+    
+    Design:
+    - Runs in a background thread, consuming events from a queue
+    - Batches writes to minimize database round-trips
+    - Flushes on batch size threshold OR time interval (whichever comes first)
+    - Thread-safe queue operations
+    - Graceful shutdown with final flush
+    
+    Trade-offs (In-Memory Queue):
+    + No external dependencies (Redis/Kafka)
+    + Low latency for high-throughput
+    + Simple incremental adoption
+    - Data loss on crash (mitigated by periodic commits)
+    - Single-process only (fine for this pipeline)
+    """
+    
+    def __init__(
+        self,
+        database_url: str,
+        batch_size: int = 50,
+        flush_interval_seconds: float = 5.0,
+        max_queue_size: int = 10000,
+    ):
+        """
+        Initialize the async DB writer.
+        
+        Args:
+            database_url: PostgreSQL connection string
+            batch_size: Number of events to batch before writing
+            flush_interval_seconds: Max time to wait before flushing
+            max_queue_size: Max queue size (backpressure mechanism)
+        """
+        self.database_url = database_url
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval_seconds
+        self.max_queue_size = max_queue_size
+        
+        # Thread-safe queue for events
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        
+        # Background writer thread
+        self._writer_thread: Optional[threading.Thread] = None
+        self._running = False
+        
+        # Stats for monitoring
+        self._stats = {
+            "events_received": 0,
+            "events_written": 0,
+            "batches_written": 0,
+            "errors": 0,
+            "last_flush_time": None,
+        }
+        self._stats_lock = threading.Lock()
+        
+        # Brand cache to avoid repeated lookups
+        self._brand_cache: dict[str, str] = {}  # domain/name -> brand_id
+        self._brand_cache_lock = threading.Lock()
+    
+    def start(self):
+        """Start the background writer thread"""
+        if self._running:
+            return
+        
+        self._running = True
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="AsyncDBWriter",
+            daemon=True  # Dies with main thread
+        )
+        self._writer_thread.start()
+        
+        # Register cleanup on exit
+        atexit.register(self.shutdown)
+        
+        print("  ✅ AsyncDBWriter started (background thread)")
+    
+    def shutdown(self, timeout: float = 30.0):
+        """
+        Graceful shutdown: flush remaining events and stop thread.
+        
+        Args:
+            timeout: Max seconds to wait for flush
+        """
+        if not self._running:
+            return
+        
+        print("\n  🛑 AsyncDBWriter shutting down...")
+        
+        # Signal shutdown
+        self._running = False
+        
+        # Send shutdown event to unblock the queue
+        try:
+            self._queue.put_nowait(ShutdownEvent())
+        except queue.Full:
+            pass
+        
+        # Wait for thread to finish
+        if self._writer_thread and self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=timeout)
+        
+        # Print final stats
+        with self._stats_lock:
+            print(f"  📊 Final stats: {self._stats['events_written']}/{self._stats['events_received']} events written, "
+                  f"{self._stats['batches_written']} batches, {self._stats['errors']} errors")
+    
+    def emit(self, event: AdEvent) -> bool:
+        """
+        Emit an event to the queue (non-blocking).
+        
+        Args:
+            event: AdEvent to queue for writing
+            
+        Returns:
+            True if queued successfully, False if queue is full
+        """
+        if not self._running:
+            print("  ⚠️ AsyncDBWriter not running, event dropped")
+            return False
+        
+        try:
+            self._queue.put_nowait(event)
+            with self._stats_lock:
+                self._stats["events_received"] += 1
+            return True
+        except queue.Full:
+            print("  ⚠️ Event queue full, applying backpressure...")
+            # Block with timeout as backpressure
+            try:
+                self._queue.put(event, timeout=5.0)
+                with self._stats_lock:
+                    self._stats["events_received"] += 1
+                return True
+            except queue.Full:
+                print("  ❌ Event dropped due to queue overflow")
+                return False
+    
+    def flush_sync(self, timeout: float = 10.0) -> bool:
+        """
+        Synchronously flush all pending events.
+        Blocks until flush is complete or timeout.
+        
+        Args:
+            timeout: Max seconds to wait
+            
+        Returns:
+            True if flush completed, False on timeout
+        """
+        if not self._running:
+            return False
+        
+        flush_event = FlushEvent()
+        try:
+            self._queue.put(flush_event, timeout=1.0)
+            return flush_event.wait_event.wait(timeout=timeout)
+        except queue.Full:
+            return False
+    
+    def get_stats(self) -> dict:
+        """Get current writer statistics"""
+        with self._stats_lock:
+            return dict(self._stats)
+    
+    def _writer_loop(self):
+        """
+        Main writer loop - runs in background thread.
+        Collects events into batches and writes them to the database.
+        """
+        conn = None
+        pending_events: list[AdEvent] = []
+        last_flush_time = time.time()
+        
+        try:
+            # Create dedicated connection for this thread
+            conn = psycopg2.connect(self.database_url)
+            conn.set_session(autocommit=False)
+            
+            while self._running or not self._queue.empty():
+                try:
+                    # Calculate time until next forced flush
+                    time_since_flush = time.time() - last_flush_time
+                    wait_time = max(0.1, self.flush_interval - time_since_flush)
+                    
+                    # Get event from queue with timeout
+                    try:
+                        event = self._queue.get(timeout=wait_time)
+                    except queue.Empty:
+                        event = None
+                    
+                    # Handle special events
+                    if isinstance(event, ShutdownEvent):
+                        break
+                    
+                    if isinstance(event, FlushEvent):
+                        # Immediate flush requested
+                        if pending_events:
+                            self._write_batch(conn, pending_events)
+                            pending_events = []
+                            last_flush_time = time.time()
+                        event.wait_event.set()
+                        continue
+                    
+                    # Add regular event to pending batch
+                    if event and isinstance(event, AdEvent):
+                        pending_events.append(event)
+                    
+                    # Check if we should flush
+                    should_flush = (
+                        len(pending_events) >= self.batch_size or
+                        (pending_events and time.time() - last_flush_time >= self.flush_interval)
+                    )
+                    
+                    if should_flush and pending_events:
+                        self._write_batch(conn, pending_events)
+                        pending_events = []
+                        last_flush_time = time.time()
+                    
+                except Exception as e:
+                    print(f"  ❌ Writer loop error: {e}")
+                    with self._stats_lock:
+                        self._stats["errors"] += 1
+                    
+                    # Reconnect on connection errors
+                    if conn is None or conn.closed:
+                        try:
+                            conn = psycopg2.connect(self.database_url)
+                            conn.set_session(autocommit=False)
+                        except Exception as reconnect_error:
+                            print(f"  ❌ Reconnect failed: {reconnect_error}")
+                            time.sleep(1)
+            
+            # Final flush on shutdown
+            if pending_events:
+                print(f"  💾 Final flush: {len(pending_events)} events...")
+                self._write_batch(conn, pending_events)
+                
+        except Exception as e:
+            print(f"  ❌ Writer thread fatal error: {e}")
+        finally:
+            if conn and not conn.closed:
+                conn.close()
+    
+    def _write_batch(self, conn, events: list[AdEvent]):
+        """
+        Write a batch of events to the database.
+        Uses execute_batch for efficient bulk inserts.
+        """
+        if not events:
+            return
+        
+        cursor = None
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Prepare batch data
+            brand_ids = {}  # sponsor_name -> brand_id
+            
+            # Step 1: Find or create brands (with caching)
+            for event in events:
+                cache_key = self._get_brand_cache_key(event.sponsor_name, event.sponsor_url)
+                
+                with self._brand_cache_lock:
+                    if cache_key in self._brand_cache:
+                        brand_ids[event.sponsor_name] = self._brand_cache[cache_key]
+                        continue
+                
+                # Look up or create brand
+                brand_id = self._find_or_create_brand(cursor, event.sponsor_name, event.sponsor_url)
+                brand_ids[event.sponsor_name] = brand_id
+                
+                with self._brand_cache_lock:
+                    self._brand_cache[cache_key] = brand_id
+            
+            # Step 2: Batch insert ads
+            ad_records = []
+            for event in events:
+                ad_id = str(uuid.uuid4())
+                brand_id = brand_ids.get(event.sponsor_name)
+                
+                if not brand_id:
+                    continue
+                
+                # Clean ad_content: remove sponsorName and productName (now separate columns)
+                # These are stored in dedicated columns, not in JSON
+                clean_ad_content = {k: v for k, v in event.ad_content.items() 
+                                   if k not in ("sponsorName", "productName")}
+                
+                ad_records.append((
+                    ad_id,
+                    event.episode_id,
+                    brand_id,
+                    event.start_time,
+                    event.end_time,
+                    event.ad_type,
+                    event.ad_format,
+                    Json(clean_ad_content),
+                    event.confidence_score,
+                    event.sponsor_name,
+                    event.product_name or None,
+                ))
+            
+            if ad_records:
+                execute_batch(
+                    cursor,
+                    '''
+                    INSERT INTO "PodcastAd" (
+                        id, "episodeId", "brandId",
+                        start_time, end_time,
+                        ad_type, ad_format, ad_content,
+                        "confidenceScore",
+                        sponsor_name, product_name,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s,
+                        %s, %s,
+                        NOW(), NOW()
+                    )
+                    ''',
+                    ad_records,
+                    page_size=100
+                )
+            
+            conn.commit()
+            
+            # Update stats
+            with self._stats_lock:
+                self._stats["events_written"] += len(events)
+                self._stats["batches_written"] += 1
+                self._stats["last_flush_time"] = datetime.now().isoformat()
+            
+        except Exception as e:
+            print(f"  ❌ Batch write error: {e}")
+            if conn and not conn.closed:
+                conn.rollback()
+            with self._stats_lock:
+                self._stats["errors"] += 1
+            raise
+        finally:
+            if cursor:
+                cursor.close()
+    
+    def _get_brand_cache_key(self, name: str, url: str) -> str:
+        """Generate cache key for brand lookup"""
+        domain = extract_domain_from_url(url) if url else ""
+        return f"{name.lower().strip()}|{domain.lower()}"
+    
+    def _find_or_create_brand(self, cursor, brand_name: str, brand_url: str) -> str:
+        """Find existing brand by domain or create a new one."""
+        domain = extract_domain_from_url(brand_url)
+        if not domain:
+            domain = brand_name.lower().replace(' ', '').replace('.', '') + '.com'
+        
+        # Check by domain
+        cursor.execute('''
+            SELECT id FROM "BrandProfile" 
+            WHERE LOWER(domain) = LOWER(%s)
+            LIMIT 1
+        ''', (domain,))
+        
+        result = cursor.fetchone()
+        if result:
+            return result['id'] if isinstance(result, dict) else result[0]
+        
+        # Check by name
+        cursor.execute('''
+            SELECT id FROM "BrandProfile" 
+            WHERE LOWER(name) = LOWER(%s)
+            LIMIT 1
+        ''', (brand_name,))
+        
+        result = cursor.fetchone()
+        if result:
+            return result['id'] if isinstance(result, dict) else result[0]
+        
+        # Create new brand
+        brand_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO "BrandProfile" (
+                id, status, origin, claimed_by_brand, name, domain, 
+                details, social_links, other_details,
+                created_at, updated_at
+            ) VALUES (
+                %s, 'INACTIVE', 'AUTO', false, %s, %s,
+                '{}', '{}', '{}',
+                NOW(), NOW()
+            )
+            ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
+            RETURNING id
+        ''', (brand_id, brand_name, domain))
+        
+        result = cursor.fetchone()
+        return result['id'] if isinstance(result, dict) else result[0]
+
+
+# =============================================================================
+# EVENT EMITTER - Helper class for emitting events from processing
+# =============================================================================
+
+class AdEventEmitter:
+    """
+    Helper class for emitting ad detection events.
+    Provides a clean interface between the processing logic and the queue.
+    """
+    
+    def __init__(self, writer: AsyncDBWriter):
+        self.writer = writer
+        self._local_stats = {
+            "ads_emitted": 0,
+            "brand_love_emitted": 0,
+            "duplicates_skipped": 0,
+        }
+    
+    def emit_ad(
+        self,
+        episode_id: str,
+        ad_segment,  # AdSegment from detector
+        ad_content: dict,
+        is_brand_love: bool = False,
+    ) -> bool:
+        """
+        Emit an ad detection event.
+        
+        Args:
+            episode_id: Episode ID
+            ad_segment: AdSegment object from detector
+            ad_content: Full ad content dict
+            is_brand_love: Whether this is a brand love mention
+            
+        Returns:
+            True if event was queued successfully
+        """
+        # Determine ad type and format
+        if is_brand_love:
+            ad_type = "BRAND_LOVE"
+            ad_format = "ENDORSEMENT"
+        else:
+            # Use HOST_READ as default since adType is no longer in ad_content
+            ad_type = "HOST_READ"
+            ad_format = "UNCLASSIFIED"
+        
+        event = AdEvent(
+            event_type=EventType.BRAND_LOVE_DETECTED if is_brand_love else EventType.AD_DETECTED,
+            episode_id=episode_id,
+            sponsor_name=ad_content.get("sponsorName", "Unknown Brand"),
+            sponsor_url=ad_content.get("sponsorUrl", ""),
+            start_time=int(ad_segment.start_time),
+            end_time=int(ad_segment.end_time),
+            confidence_score=ad_segment.confidence_score,
+            ad_content=ad_content,
+            product_name=ad_content.get("productName", ""),
+            ad_type=ad_type,
+            ad_format=ad_format,
+            is_brand_love=is_brand_love,
+        )
+        
+        success = self.writer.emit(event)
+        
+        if success:
+            if is_brand_love:
+                self._local_stats["brand_love_emitted"] += 1
+            else:
+                self._local_stats["ads_emitted"] += 1
+        
+        return success
+    
+    def get_local_stats(self) -> dict:
+        """Get stats for this emitter instance"""
+        return dict(self._local_stats)
 
 
 # =============================================================================
@@ -270,6 +816,244 @@ MIN_CONFIDENCE_TO_SAVE = 0.75
 HIGH_CONFIDENCE_THRESHOLD = 0.90
 BRAND_LOVE_CONFIDENCE = 0.20  # Very low confidence for brand love
 
+# Deduplication: Skip ads from the same sponsor within this time window (seconds)
+AD_DEDUP_WINDOW_SECONDS = 300  # 5 minutes
+SPONSOR_SIMILARITY_THRESHOLD = 0.75  # Minimum similarity score to consider sponsors as same
+
+
+def are_sponsors_similar(sponsor1: str, sponsor2: str, threshold: float = SPONSOR_SIMILARITY_THRESHOLD) -> bool:
+    """
+    Determine if two sponsor names are semantically similar.
+    
+    Uses a multi-layered approach:
+    1. Exact match (after normalization)
+    2. Containment check (e.g., "Lenovo" is in "Lenovo Pro")
+    3. Token overlap (core brand words match)
+    4. Fuzzy string matching (handles typos, variations)
+    
+    Examples that should match:
+    - "Lenovo" and "Lenovo Pro" -> True (containment)
+    - "Better Help" and "BetterHelp" -> True (fuzzy match)
+    - "Athletic Greens" and "AG1 by Athletic Greens" -> True (token overlap)
+    
+    Args:
+        sponsor1: First sponsor name
+        sponsor2: Second sponsor name
+        threshold: Minimum similarity score (0.0 to 1.0)
+    
+    Returns:
+        True if sponsors are considered the same, False otherwise
+    """
+    if not sponsor1 or not sponsor2:
+        return False
+    
+    # Normalize: lowercase, strip whitespace
+    s1 = sponsor1.lower().strip()
+    s2 = sponsor2.lower().strip()
+    
+    # 1. Exact match
+    if s1 == s2:
+        return True
+    
+    # 2. Containment check - if one fully contains the other
+    # Handles: "Lenovo" vs "Lenovo Pro", "AG1" vs "AG1 Athletic Greens"
+    if s1 in s2 or s2 in s1:
+        return True
+    
+    # 3. Token-based overlap - check if core brand words match
+    # Remove common suffixes/modifiers that don't change brand identity
+    noise_words = {'inc', 'llc', 'ltd', 'co', 'company', 'corp', 'pro', 'plus', 
+                   'premium', 'business', 'enterprise', 'by', 'the', 'and', 'for'}
+    
+    tokens1 = set(s1.replace('-', ' ').replace('.', ' ').split()) - noise_words
+    tokens2 = set(s2.replace('-', ' ').replace('.', ' ').split()) - noise_words
+    
+    if tokens1 and tokens2:
+        # If any significant token matches, high chance it's the same brand
+        common_tokens = tokens1 & tokens2
+        if common_tokens:
+            # At least one meaningful word matches - likely same sponsor
+            # Calculate overlap ratio for confidence
+            overlap_ratio = len(common_tokens) / min(len(tokens1), len(tokens2))
+            if overlap_ratio >= 0.5:  # At least half the tokens match
+                return True
+    
+    # 4. Fuzzy string matching - handles minor variations
+    # Uses SequenceMatcher which is good at finding "gestalt pattern matching"
+    # Handles: "BetterHelp" vs "Better Help", "HelloFresh" vs "Hello Fresh"
+    ratio = difflib.SequenceMatcher(None, s1, s2).ratio()
+    if ratio >= threshold:
+        return True
+    
+    # 5. First-word match (often the brand name)
+    # Handles: "Lenovo" vs "Lenovo Pro Solutions", "Nike" vs "Nike Running"
+    first_word1 = s1.split()[0] if s1.split() else ""
+    first_word2 = s2.split()[0] if s2.split() else ""
+    if first_word1 and first_word2 and len(first_word1) >= 3 and len(first_word2) >= 3:
+        if first_word1 == first_word2:
+            return True
+        # Also check fuzzy match on first words (e.g., "betterhelp" vs "better")
+        first_word_ratio = difflib.SequenceMatcher(None, first_word1, first_word2).ratio()
+        if first_word_ratio >= 0.8:
+            return True
+    
+    return False
+
+
+def find_similar_sponsor(new_sponsor: str, recent_ads: dict) -> tuple[str, float] | None:
+    """
+    Find a similar sponsor in the recent_ads dictionary.
+    
+    Args:
+        new_sponsor: The new sponsor name to check
+        recent_ads: Dictionary of {normalized_sponsor: end_time}
+    
+    Returns:
+        Tuple of (matching_sponsor_key, end_time) if found, None otherwise
+    """
+    if not new_sponsor:
+        return None
+    
+    normalized_new = new_sponsor.lower().strip()
+    if normalized_new == "unknown brand":
+        return None
+    
+    for existing_sponsor, end_time in recent_ads.items():
+        if are_sponsors_similar(normalized_new, existing_sponsor):
+            return (existing_sponsor, end_time)
+    
+    return None
+
+
+def extract_distinct_sponsors_from_segment(ad_content: dict) -> list[dict]:
+    """
+    Extract distinct sponsors from a single segment that might contain multiple ads.
+    
+    Uses the same similarity logic as deduplication to identify when a segment
+    contains 2+ different sponsors (e.g., "BetterHelp" and "Athletic Greens" 
+    mentioned in the same ad break).
+    
+    Args:
+        ad_content: The ad content dict with allSponsors, allCompanies, allUrls, etc.
+    
+    Returns:
+        List of distinct sponsor dicts. If only one sponsor is found, returns a list
+        with just the original ad_content. If multiple distinct sponsors are found,
+        returns multiple dicts with sponsor-specific information.
+    """
+    all_sponsors = ad_content.get("allSponsors", [])
+    all_companies = ad_content.get("allCompanies", [])
+    all_urls = ad_content.get("allUrls", [])
+    all_promo_codes = ad_content.get("allPromoCodes", [])
+    
+    # Combine sponsors and companies as potential distinct advertisers
+    all_potential_sponsors = []
+    for s in all_sponsors:
+        if s and s.strip() and s.lower() not in ["unknown brand", "unknown"]:
+            all_potential_sponsors.append(s.strip())
+    for c in all_companies:
+        if c and c.strip() and c.lower() not in ["unknown brand", "unknown"]:
+            # Only add company if it's not already similar to an existing sponsor
+            is_duplicate = False
+            for existing in all_potential_sponsors:
+                if are_sponsors_similar(c, existing):
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                all_potential_sponsors.append(c.strip())
+    
+    # If we have 0 or 1 sponsors, return the original content
+    if len(all_potential_sponsors) <= 1:
+        return [ad_content]
+    
+    # Group sponsors by similarity
+    sponsor_groups = []  # List of lists, each inner list is similar sponsors
+    
+    for sponsor in all_potential_sponsors:
+        found_group = False
+        for group in sponsor_groups:
+            # Check if this sponsor is similar to any in the group
+            if any(are_sponsors_similar(sponsor, existing) for existing in group):
+                group.append(sponsor)
+                found_group = True
+                break
+        if not found_group:
+            sponsor_groups.append([sponsor])
+    
+    # If all sponsors group into one, return original
+    if len(sponsor_groups) <= 1:
+        return [ad_content]
+    
+    # Multiple distinct sponsors detected - create separate ad_content for each
+    print(f"    🔀 Detected {len(sponsor_groups)} distinct ads in segment:")
+    distinct_ads = []
+    
+    for i, group in enumerate(sponsor_groups):
+        # Pick the first (likely best) sponsor name from the group
+        primary_sponsor = group[0]
+        print(f"       • Ad {i+1}: {primary_sponsor}")
+        
+        # Try to find a URL that matches this sponsor
+        matched_url = ""
+        for url in all_urls:
+            if url:
+                url_lower = url.lower()
+                sponsor_lower = primary_sponsor.lower().replace(" ", "").replace("-", "")
+                # Check if sponsor name is in the URL
+                if sponsor_lower[:4] in url_lower or any(part in url_lower for part in sponsor_lower.split() if len(part) > 3):
+                    matched_url = url
+                    break
+        
+        # If no specific URL match, don't assign any URL (avoid wrong attribution)
+        sponsor_url = matched_url
+        
+        # Try to find a promo code that might be for this sponsor
+        # Promo codes often contain brand name or first letters
+        sponsor_code = ""
+        for code in all_promo_codes:
+            if code:
+                code_lower = code.lower()
+                sponsor_lower = primary_sponsor.lower()
+                # Check if promo code relates to this sponsor
+                if sponsor_lower[:3] in code_lower or code_lower in sponsor_lower:
+                    sponsor_code = code
+                    break
+        
+        # Create a new ad_content for this specific sponsor
+        new_ad_content = {
+            "sponsorName": primary_sponsor,
+            "productName": ad_content.get("productName", ""),  # Keep original if any
+            "sponsorUrl": sponsor_url,
+            "sponsorCode": sponsor_code,
+            "discountOffer": ad_content.get("discountOffer", ""),
+            "callToAction": ad_content.get("callToAction", ""),
+            # Keep original lists for reference
+            "allCompanies": group,  # Just this group
+            "allSponsors": group,
+            "allUrls": [matched_url] if matched_url else [],
+            "allPromoCodes": [sponsor_code] if sponsor_code else [],
+            "discounts": ad_content.get("discounts", []),
+            "matchedPhrases": ad_content.get("matchedPhrases", []),
+            "entities": ad_content.get("entities", {}),
+            "relations": ad_content.get("relations", []),
+            "modelConfidence": ad_content.get("modelConfidence", 0),
+            "llmConfidence": ad_content.get("llmConfidence", 0),
+            "combinedConfidence": ad_content.get("combinedConfidence", 0),
+            "isBrandLove": ad_content.get("isBrandLove", False),
+            "contextExpanded": ad_content.get("contextExpanded", False),
+            "splitFromMultiAd": True,  # Flag to indicate this was split
+            "totalAdsInSegment": len(sponsor_groups),
+        }
+        distinct_ads.append(new_ad_content)
+    
+    return distinct_ads
+
+
+# Async writer configuration
+BATCH_SIZE = 50  # Flush after this many events
+FLUSH_INTERVAL_SECONDS = 5.0  # Or flush after this many seconds
+MAX_QUEUE_SIZE = 10000  # Backpressure threshold
+
 
 def get_context_text(transcript_data: dict, ad_start: float, ad_end: float, context_seconds: float = 30) -> str:
     """Get the ad text plus surrounding context from transcript."""
@@ -338,18 +1122,26 @@ JSON Schema:
   "is_ad": boolean (true if sponsored ad, false if not or if brand love),
   "is_brand_love": boolean (true if just a casual mention/shoutout without commercial elements),
   "confidence": float (0.0-1.0, VERY LOW for brand love),
-  "sponsor": string or null (company/brand name),
+  "sponsor": string or null (company/brand name - the PRIMARY sponsor being advertised),
   "sponsor_url": string or null (website mentioned - REQUIRED for real ads),
   "promo_code": string or null (discount code if mentioned),
   "discount_offer": string or null (e.g., "20% off", "free trial"),
   "product_name": string or null (specific product advertised),
   "ad_type": "host_read" | "pre_recorded" | "unknown",
   "call_to_action": string or null (what listeners are asked to do),
-  "brand_love_reason": string or null (why this is brand love, not a real ad)
+  "brand_love_reason": string or null (why this is brand love, not a real ad),
+  "likely_multiple_ads": boolean (true if this segment appears to contain ads for MULTIPLE DIFFERENT sponsors/brands),
+  "other_sponsors_hint": array of strings or null (if likely_multiple_ads is true, list other sponsor names you detected)
 }}
 
-IMPORTANT: If there's NO URL, NO promo code, NO discount, and NO clear call-to-action,
-this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=0.2 or lower."""
+IMPORTANT NOTES:
+1. If there's NO URL, NO promo code, NO discount, and NO clear call-to-action,
+   this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=0.2 or lower.
+
+2. MULTIPLE ADS DETECTION: Sometimes a transcript segment contains back-to-back ads for different brands.
+   If you notice mentions of multiple distinct sponsors with their own URLs/promo codes/offers,
+   set likely_multiple_ads=true and list the other sponsor names in other_sponsors_hint.
+   Focus on the PRIMARY sponsor for the main fields, and flag the others for further analysis."""
 
     # Default fallback response
     default_response = {
@@ -357,6 +1149,7 @@ this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=
         "sponsor": None, "sponsor_url": None, "promo_code": None,
         "discount_offer": None, "product_name": None, "ad_type": "unknown",
         "call_to_action": None, "brand_love_reason": None,
+        "likely_multiple_ads": False, "other_sponsors_hint": None,
     }
     
     try:
@@ -436,6 +1229,13 @@ this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=
                 return val.lower() in ('true', '1', 'yes')
             return bool(val)
 
+        def safe_list(val):
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return [str(v).strip() for v in val if v]
+            return None
+
         return {
             "is_ad": safe_bool(result.get("is_ad")),
             "is_brand_love": safe_bool(result.get("is_brand_love")),
@@ -448,6 +1248,8 @@ this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=
             "ad_type": safe_str(result.get("ad_type")) or "unknown",
             "call_to_action": safe_str(result.get("call_to_action")),
             "brand_love_reason": safe_str(result.get("brand_love_reason")),
+            "likely_multiple_ads": safe_bool(result.get("likely_multiple_ads")),
+            "other_sponsors_hint": safe_list(result.get("other_sponsors_hint")),
         }
 
     except Exception as e:
@@ -457,7 +1259,70 @@ this is likely BRAND LOVE, not a real ad. Set is_brand_love=true and confidence=
 
 def get_db_connection():
     """Create and return a database connection"""
-    return psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL)
+    # Set a longer timeout for the connection
+    conn.set_session(autocommit=False)
+    return conn
+
+
+def is_connection_alive(conn) -> bool:
+    """Check if database connection is still alive"""
+    if conn is None or conn.closed:
+        return False
+    try:
+        # Simple query to test connection
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def safe_rollback(conn):
+    """Safely rollback a connection, handling already-closed connections"""
+    if conn is None:
+        return
+    try:
+        if not conn.closed:
+            conn.rollback()
+    except Exception:
+        pass  # Connection already closed or invalid
+
+
+def safe_close(conn, cursor=None):
+    """Safely close cursor and connection"""
+    if cursor is not None:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+    if conn is not None:
+        try:
+            if not conn.closed:
+                conn.close()
+        except Exception:
+            pass
+
+
+def reconnect_if_needed(conn, cursor) -> tuple:
+    """
+    Check if connection is alive, reconnect if needed.
+    Returns (conn, cursor) tuple - either existing or new.
+    """
+    if is_connection_alive(conn):
+        return conn, cursor
+    
+    print("  🔄 Database connection lost, reconnecting...")
+    safe_close(conn, cursor)
+    
+    try:
+        new_conn = get_db_connection()
+        new_cursor = new_conn.cursor(cursor_factory=RealDictCursor)
+        print("  ✅ Reconnected to database")
+        return new_conn, new_cursor
+    except Exception as e:
+        print(f"  ❌ Failed to reconnect: {e}")
+        raise
 
 
 def extract_domain_from_url(url: str) -> str:
@@ -476,93 +1341,6 @@ def extract_domain_from_url(url: str) -> str:
         return url.lower()
 
 
-def find_or_create_brand(cursor, brand_name: str, brand_url: str) -> str:
-    """Find existing brand by domain or create a new one."""
-    domain = extract_domain_from_url(brand_url)
-    if not domain:
-        domain = brand_name.lower().replace(' ', '').replace('.', '') + '.com'
-    
-    cursor.execute('''
-        SELECT id FROM "BrandProfile" 
-        WHERE LOWER(domain) = LOWER(%s)
-        LIMIT 1
-    ''', (domain,))
-    
-    result = cursor.fetchone()
-    if result:
-        return result['id'] if isinstance(result, dict) else result[0]
-    
-    cursor.execute('''
-        SELECT id FROM "BrandProfile" 
-        WHERE LOWER(name) = LOWER(%s)
-        LIMIT 1
-    ''', (brand_name,))
-    
-    result = cursor.fetchone()
-    if result:
-        return result['id'] if isinstance(result, dict) else result[0]
-    
-    brand_id = str(uuid.uuid4())
-    cursor.execute('''
-        INSERT INTO "BrandProfile" (
-            id, status, origin, claimed_by_brand, name, domain, 
-            details, social_links, other_details,
-            created_at, updated_at
-        ) VALUES (
-            %s, 'INACTIVE', 'AUTO', false, %s, %s,
-            '{}', '{}', '{}',
-            NOW(), NOW()
-        )
-        ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
-        RETURNING id
-    ''', (brand_id, brand_name, domain))
-    
-    result = cursor.fetchone()
-    return result['id'] if isinstance(result, dict) else result[0]
-
-
-def save_podcast_ad(cursor, episode_id: str, brand_id: str, ad_segment, ad_content: dict):
-    """Save a detected ad to the PodcastAd table"""
-    ad_id = str(uuid.uuid4())
-    start_time = int(ad_segment.start_time)
-    end_time = int(ad_segment.end_time)
-    
-    ad_type_map = {
-        "host_read": "HOST_READ",
-        "pre_recorded": "PRE_PRODUCED",
-        "dynamic_insertion": "DYNAMICALLY_INSERTED",
-        "unknown": "UNKNOWN",
-    }
-    extracted_type = ad_content.get("adType", "unknown")
-    ad_type = ad_type_map.get(extracted_type, "HOST_READ")
-    ad_format = 'UNCLASSIFIED'
-    confidence_score = round(ad_segment.confidence_score, 4)
-    
-    cursor.execute('''
-        INSERT INTO "PodcastAd" (
-            id, "episodeId", "brandId",
-            start_time, end_time,
-            ad_type, ad_format, ad_content,
-            "confidenceScore",
-            created_at, updated_at
-        ) VALUES (
-            %s, %s, %s,
-            %s, %s,
-            %s, %s, %s,
-            %s,
-            NOW(), NOW()
-        )
-        RETURNING id
-    ''', (
-        ad_id, episode_id, brand_id,
-        start_time, end_time,
-        ad_type, ad_format, Json(ad_content),
-        confidence_score
-    ))
-    
-    return cursor.fetchone()
-
-
 def fetch_episodes(cursor, limit: int = 100000):
     """Fetch podcast episodes that need ad detection"""
     query = '''
@@ -572,8 +1350,8 @@ def fetch_episodes(cursor, limit: int = 100000):
         FROM public."PodcastEpisode" as PodcastEpi
         JOIN public."Podcast" as Podcast ON Podcast."id" = PodcastEpi."podcastId"
         WHERE PodcastEpi.duration IS NOT NULL 
-            AND PodcastEpi.duration >= 5400
-            AND PodcastEpi.duration < 6000
+            AND PodcastEpi.duration >= 7400
+            AND PodcastEpi.duration < 7900
             AND PodcastEpi."transcriptUrl" IS NOT NULL 
             AND PodcastEpi."audioUrl" IS NOT NULL 
             AND PodcastEpi."transcriptStatus" = 'COMPLETED' 
@@ -633,7 +1411,13 @@ def merge_extraction_data(gliner_data: dict, llm_data: dict) -> dict:
 
 
 def build_ad_content(ad, llm_result: dict, combined_score: float) -> dict:
-    """Build comprehensive ad_content using GLiNER2 structured data + LLM verification."""
+    """
+    Build comprehensive ad_content using GLiNER2 structured data + LLM verification.
+    
+    Returns a dict with two top-level keys for DB columns (sponsorName, productName)
+    and cleaned ad_content (without redundant fields like adType, brandLoveReason,
+    glinerStructured, glinerClassification).
+    """
     gliner_structured = ad.structured_data or {}
     merged = merge_extraction_data(gliner_structured, llm_result)
     
@@ -650,40 +1434,181 @@ def build_ad_content(ad, llm_result: dict, combined_score: float) -> dict:
     )
     sponsor_url = merged.get("sponsor_url") or (urls[0] if urls else "")
     sponsor_code = merged.get("promo_code") or (promo_codes[0] if promo_codes else "")
+    product_name = merged.get("product_name", "")
     
+    # These fields go directly to DB columns, not in ad_content JSON
+    # sponsorName -> sponsor_name column
+    # productName -> product_name column
+    
+    # ad_content contains supporting data only - NO redundant fields:
+    # Removed: adType, brandLoveReason, glinerStructured, glinerClassification
     return {
+        # Top-level fields for separate DB columns
         "sponsorName": sponsor_name,
+        "productName": product_name,
+        # Fields that go into ad_content JSON column
         "sponsorUrl": sponsor_url,
         "sponsorCode": sponsor_code,
-        "productName": merged.get("product_name", ""),
         "discountOffer": merged.get("discount_offer", ""),
         "callToAction": merged.get("call_to_action", ""),
-        "adType": merged.get("ad_type", "unknown"),
         "allCompanies": companies,
         "allSponsors": sponsors,
         "allUrls": urls,
         "allPromoCodes": promo_codes,
         "discounts": ad.signals.get("discounts", []),
         "matchedPhrases": ad.signals.get("matched_phrases", []),
-        "glinerStructured": gliner_structured,
         "entities": ad.entities,
         "relations": ad.relations if ad.relations else [],
-        "glinerClassification": {
-            "isAd": ad.is_ad_classification,
-            "confidence": ad.classification_confidence,
-        },
         "modelConfidence": ad.confidence_score,
         "llmConfidence": llm_result.get("confidence", 0),
         "combinedConfidence": combined_score,
         "isBrandLove": llm_result.get("is_brand_love", False),
-        "brandLoveReason": llm_result.get("brand_love_reason"),
         "contextExpanded": ad.context_expanded,
     }
 
 
-def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcript_url: str):
+def build_brand_love_content(ad, source: str = "gliner", reason: str = None) -> dict:
+    """
+    Build ad_content for brand love/endorsement mentions.
+    
+    Returns clean ad_content without redundant fields (adType, brandLoveReason,
+    glinerStructured, glinerClassification removed).
+    """
+    gliner_structured = ad.structured_data or {}
+    
+    companies = ad.signals.get("companies", [])
+    sponsors = ad.signals.get("sponsors", [])
+    urls = ad.signals.get("urls", [])
+    
+    sponsor_name = (
+        gliner_structured.get("sponsor_name") or
+        (sponsors[0] if sponsors else None) or
+        (companies[0] if companies else None) or
+        "Unknown Brand"
+    )
+    sponsor_url = gliner_structured.get("sponsor_url") or (urls[0] if urls else "")
+    product_name = gliner_structured.get("product_name", "")
+    
+    # Top-level fields for DB columns + cleaned ad_content
+    # Removed: adType, brandLoveReason, glinerStructured, glinerClassification
+    return {
+        # Top-level fields for separate DB columns
+        "sponsorName": sponsor_name,
+        "productName": product_name,
+        # Fields that go into ad_content JSON column
+        "sponsorUrl": sponsor_url,
+        "sponsorCode": "",
+        "discountOffer": "",
+        "callToAction": "",
+        "isBrandLove": True,
+        "brandLoveSource": source,  # "gliner" or "gemini"
+        "allCompanies": companies,
+        "allSponsors": sponsors,
+        "allUrls": urls,
+        "allPromoCodes": [],
+        "discounts": [],
+        "matchedPhrases": ad.signals.get("matched_phrases", []),
+        "entities": ad.entities,
+        "modelConfidence": ad.confidence_score,
+        "combinedConfidence": BRAND_LOVE_CONFIDENCE,
+        "contextExpanded": ad.context_expanded if hasattr(ad, 'context_expanded') else False,
+    }
+
+
+def build_additional_ad_content(
+    hint_sponsor: str,
+    original_ad,
+    primary_ad_content: dict,
+    expanded_analysis,
+    base_confidence: float
+) -> dict:
+    """
+    Build ad_content for an additional sponsor found in a multi-ad segment.
+    
+    Uses the hint_sponsor name from LLM and tries to match it with data
+    from the expanded GLiNER analysis.
+    
+    Args:
+        hint_sponsor: Sponsor name from LLM's other_sponsors_hint
+        original_ad: The original AdSegment object
+        primary_ad_content: The primary ad's content dict (for reference)
+        expanded_analysis: AdSegment from expanded context GLiNER analysis
+        base_confidence: Base confidence score to use
+    
+    Returns:
+        Ad content dict for the additional sponsor, or None if invalid
+    """
+    if not hint_sponsor or hint_sponsor.lower().strip() in ["unknown", "unknown brand"]:
+        return None
+    
+    # Try to find matching URL/promo code from expanded analysis
+    matched_url = ""
+    matched_code = ""
+    
+    # Check expanded analysis signals for URL matching this sponsor
+    if expanded_analysis and expanded_analysis.signals:
+        all_urls = expanded_analysis.signals.get("urls", [])
+        all_codes = expanded_analysis.signals.get("promo_codes", [])
+        
+        sponsor_lower = hint_sponsor.lower().replace(" ", "").replace("-", "")
+        
+        # Find URL that matches the hint sponsor
+        for url in all_urls:
+            if url:
+                url_lower = url.lower()
+                # Check if sponsor name appears in URL
+                if sponsor_lower[:4] in url_lower or any(
+                    part in url_lower for part in sponsor_lower.split() if len(part) > 3
+                ):
+                    matched_url = url
+                    break
+        
+        # Find promo code that matches the hint sponsor  
+        for code in all_codes:
+            if code:
+                code_lower = code.lower()
+                if sponsor_lower[:3] in code_lower or code_lower in sponsor_lower:
+                    matched_code = code
+                    break
+    
+    # Build the ad content for this additional sponsor
+    return {
+        "sponsorName": hint_sponsor,
+        "productName": "",  # Unknown for derived ads
+        "sponsorUrl": matched_url,
+        "sponsorCode": matched_code,
+        "discountOffer": "",
+        "callToAction": "",
+        "allCompanies": [hint_sponsor],
+        "allSponsors": [hint_sponsor],
+        "allUrls": [matched_url] if matched_url else [],
+        "allPromoCodes": [matched_code] if matched_code else [],
+        "discounts": [],
+        "matchedPhrases": primary_ad_content.get("matchedPhrases", []),
+        "entities": expanded_analysis.entities if expanded_analysis else {},
+        "relations": [],
+        "modelConfidence": base_confidence,
+        "llmConfidence": base_confidence,  # Derived from LLM hint
+        "combinedConfidence": base_confidence,
+        "isBrandLove": False,
+        "contextExpanded": True,
+        "derivedFromMultiAd": True,  # Flag to indicate this was derived from multi-ad detection
+        "primarySponsor": primary_ad_content.get("sponsorName", ""),  # Reference to primary
+    }
+
+
+def process_episode(
+    detector: AdDetector,
+    emitter: AdEventEmitter,
+    episode_id: str,
+    transcript_url: str,
+    transcript_data: dict = None,
+) -> dict:
     """
     Process a single episode for ad detection.
+    
+    CHANGED: Now emits events to the async queue instead of direct DB writes.
+    CPU-bound ML inference is decoupled from I/O-bound database operations.
     
     Features:
     - Exclusion filtering (Patreon, social plugs, ad-free mentions)
@@ -695,11 +1620,14 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
     print(f"Processing episode: {episode_id}")
     print(f"Transcript URL: {transcript_url[:80]}...")
     
-    transcript_data = fetch_transcript(transcript_url)
-    if not transcript_data:
-        return {"detected": 0, "saved": 0, "excluded": 0, "brand_love": 0}
+    # Fetch transcript if not provided
+    if transcript_data is None:
+        transcript_data = fetch_transcript(transcript_url)
     
-    # Detect ads using GLiNER2's full capabilities
+    if not transcript_data:
+        return {"detected": 0, "emitted": 0, "excluded": 0, "brand_love": 0, "duplicates": 0}
+    
+    # Detect ads using GLiNER2's full capabilities (CPU-bound)
     ads = detector.detect_ads(
         transcript_data,
         min_confidence=AdConfidence.MEDIUM,
@@ -710,13 +1638,17 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
     
     if not ads:
         print(f"  No ads detected with medium or higher confidence.")
-        return {"detected": 0, "saved": 0, "excluded": 0, "brand_love": 0}
+        return {"detected": 0, "emitted": 0, "excluded": 0, "brand_love": 0, "duplicates": 0}
     
     print(f"  Found {len(ads)} candidate ad(s)")
     
-    saved_count = 0
+    emitted_count = 0
     excluded_count = 0
     brand_love_count = 0
+    duplicate_count = 0
+    
+    # Track recently processed ads for deduplication: {normalized_sponsor: end_time}
+    recent_ads = {}
     
     for i, ad in enumerate(ads, 1):
         print(f"\n  {'─'*60}")
@@ -730,10 +1662,20 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
             excluded_count += 1
             continue
         
-        # Check if GLiNER2 detected brand love
+        # Check if GLiNER2 detected brand love - emit as endorsement event
         if ad.is_brand_love:
-            print(f"  💝 BRAND LOVE detected by GLiNER2 (not a real ad)")
-            brand_love_count += 1
+            print(f"  💝 BRAND LOVE detected by GLiNER2")
+            ad_content = build_brand_love_content(ad, source="gliner")
+            
+            if ad_content["sponsorName"] != "Unknown Brand":
+                ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                if emitter.emit_ad(episode_id, ad, ad_content, is_brand_love=True):
+                    brand_love_count += 1
+                    print(f"  ✅ Emitted as endorsement (queued)")
+                else:
+                    print(f"  ⚠️ Failed to emit event")
+            else:
+                print(f"  ⏭️  SKIPPED - Could not identify brand")
             continue
         
         # Check if partial ad - needs context expansion
@@ -755,10 +1697,20 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
                     excluded_count += 1
                     continue
                 
-                # Check if expanded context is brand love
+                # Check if expanded context is brand love - emit as endorsement
                 if expanded_ad.is_brand_love:
-                    print(f"  💝 BRAND LOVE after expansion (not a real ad)")
-                    brand_love_count += 1
+                    print(f"  💝 BRAND LOVE after expansion")
+                    ad_content = build_brand_love_content(expanded_ad, source="gliner")
+                    
+                    if ad_content["sponsorName"] != "Unknown Brand":
+                        expanded_ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                        if emitter.emit_ad(episode_id, expanded_ad, ad_content, is_brand_love=True):
+                            brand_love_count += 1
+                            print(f"  ✅ Emitted as endorsement (queued)")
+                        else:
+                            print(f"  ⚠️ Failed to emit event")
+                    else:
+                        print(f"  ⏭️  SKIPPED - Could not identify brand")
                     continue
                 
                 # Use expanded result
@@ -796,18 +1748,30 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
             }
             combined_score = ad.confidence_score
         else:
-            # Get ad text with surrounding context for Gemini
+            # Get ad text with surrounding context for Gemini (I/O-bound but necessary)
             context_text = get_context_text(transcript_data, ad.start_time, ad.end_time)
             
             # Pass GLiNER2 data to Gemini for verification
             llm_result = verify_ad_with_gemini(context_text, ad.structured_data)
             
-            # Check for brand love from Gemini
+            # Check for brand love from Gemini - emit as endorsement
             if llm_result.get("is_brand_love"):
                 print(f"  💝 BRAND LOVE detected by Gemini")
-                if llm_result.get("brand_love_reason"):
-                    print(f"     Reason: {llm_result['brand_love_reason']}")
-                brand_love_count += 1
+                reason = llm_result.get("brand_love_reason")
+                if reason:
+                    print(f"     Reason: {reason}")
+                
+                ad_content = build_brand_love_content(ad, source="gemini", reason=reason)
+                
+                if ad_content["sponsorName"] != "Unknown Brand":
+                    ad.confidence_score = BRAND_LOVE_CONFIDENCE
+                    if emitter.emit_ad(episode_id, ad, ad_content, is_brand_love=True):
+                        brand_love_count += 1
+                        print(f"  ✅ Emitted as endorsement (queued)")
+                    else:
+                        print(f"  ⚠️ Failed to emit event")
+                else:
+                    print(f"  ⏭️  SKIPPED - Could not identify brand")
                 continue
             
             if llm_result["confidence"] == 0 and not llm_result["is_ad"]:
@@ -852,7 +1816,7 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
         ad_content = build_ad_content(ad, llm_result, combined_score)
         
         sponsor_name = ad_content["sponsorName"]
-        sponsor_url = ad_content["sponsorUrl"]
+        sponsor_url = ad_content.get("sponsorUrl", "")
         
         print(f"  Sponsor:     {sponsor_name}")
         if ad_content.get("productName"):
@@ -862,24 +1826,118 @@ def process_episode(detector: AdDetector, conn, cursor, episode_id: str, transcr
         if ad_content.get("sponsorUrl"):
             print(f"  URL:         {ad_content['sponsorUrl']}")
         
-        try:
-            cursor.execute("SAVEPOINT ad_save")
-            brand_id = find_or_create_brand(cursor, sponsor_name, sponsor_url)
+        # === STEP 1: ALWAYS EMIT THE PRIMARY DETECTED AD FIRST ===
+        # This ensures we don't lose the sponsor info that LLM verified
+        normalized_sponsor = sponsor_name.lower().strip() if sponsor_name else ""
+        
+        # Deduplication check for the primary ad
+        primary_emitted = False
+        similar_match = find_similar_sponsor(sponsor_name, recent_ads)
+        if similar_match:
+            matched_sponsor, last_end_time = similar_match
+            time_since_last = ad.start_time - last_end_time
+            if 0 < time_since_last < AD_DEDUP_WINDOW_SECONDS:
+                print(f"  ⏭️  SKIPPED primary ad ({sponsor_name}) - Duplicate of {matched_sponsor}")
+                duplicate_count += 1
+            else:
+                primary_emitted = True
+        else:
+            primary_emitted = True
+        
+        if primary_emitted:
             ad.confidence_score = combined_score
-            save_podcast_ad(cursor, episode_id, brand_id, ad, ad_content)
-            cursor.execute("RELEASE SAVEPOINT ad_save")
-            saved_count += 1
-            print(f"  ✅ Saved (combined confidence: {combined_score:.0%})")
-        except Exception as e:
-            cursor.execute("ROLLBACK TO SAVEPOINT ad_save")
-            print(f"  ❌ Error saving: {e}")
-            continue
+            if emitter.emit_ad(episode_id, ad, ad_content):
+                emitted_count += 1
+                print(f"  ✅ Emitted primary ad: {sponsor_name} (confidence: {combined_score:.0%})")
+                # Track for deduplication
+                if normalized_sponsor and normalized_sponsor != "unknown brand":
+                    recent_ads[normalized_sponsor] = ad.end_time
+            else:
+                print(f"  ❌ Failed to emit primary ad")
+        
+        # === STEP 2: CHECK IF LLM HINTS AT MULTIPLE ADS ===
+        # Only expand context and re-analyze if LLM suggests there are more ads
+        likely_multiple = llm_result.get("likely_multiple_ads", False)
+        other_sponsors_hint = llm_result.get("other_sponsors_hint") or []
+        
+        if likely_multiple and other_sponsors_hint:
+            print(f"  🔀 LLM hints at {len(other_sponsors_hint)} additional ad(s): {', '.join(other_sponsors_hint)}")
+            
+            # Track which hinted sponsors we've processed
+            processed_hints = set()
+            processed_hints.add(normalized_sponsor)  # Already processed primary
+            
+            # Expand context for re-analysis with GLiNER
+            EXPANDED_CONTEXT_SECONDS = 60  # Larger window for multi-ad segments
+            expanded_context_text = get_context_text(
+                transcript_data, ad.start_time, ad.end_time, 
+                context_seconds=EXPANDED_CONTEXT_SECONDS
+            )
+            
+            # Re-analyze expanded context with GLiNER to get structured data for additional sponsors
+            expanded_analysis = detector.analyze_segment(
+                expanded_context_text,
+                ad.start_time - EXPANDED_CONTEXT_SECONDS,
+                ad.end_time + EXPANDED_CONTEXT_SECONDS,
+                use_combined=True,
+                skip_exclusion_check=True  # Don't re-check exclusions, already validated
+            )
+            
+            for hint_sponsor in other_sponsors_hint:
+                hint_normalized = hint_sponsor.lower().strip()
+                
+                # Skip if similar to primary sponsor
+                if are_sponsors_similar(hint_normalized, normalized_sponsor):
+                    continue
+                
+                # Skip if already processed a similar sponsor
+                already_processed = False
+                for processed in processed_hints:
+                    if are_sponsors_similar(hint_normalized, processed):
+                        already_processed = True
+                        break
+                if already_processed:
+                    continue
+                
+                # Deduplication check
+                similar_match = find_similar_sponsor(hint_sponsor, recent_ads)
+                if similar_match:
+                    matched_sponsor, last_end_time = similar_match
+                    time_since_last = ad.start_time - last_end_time
+                    if 0 < time_since_last < AD_DEDUP_WINDOW_SECONDS:
+                        print(f"    ⏭️  SKIPPED additional ad ({hint_sponsor}) - Duplicate")
+                        duplicate_count += 1
+                        processed_hints.add(hint_normalized)
+                        continue
+                
+                # Build ad content for the additional sponsor using expanded GLiNER analysis
+                additional_ad_content = build_additional_ad_content(
+                    hint_sponsor, 
+                    ad, 
+                    ad_content, 
+                    expanded_analysis,
+                    combined_score * 0.9  # Slightly lower confidence for derived ads
+                )
+                
+                if additional_ad_content:
+                    ad.confidence_score = additional_ad_content["combinedConfidence"]
+                    if emitter.emit_ad(episode_id, ad, additional_ad_content):
+                        emitted_count += 1
+                        print(f"    ✅ Emitted additional ad: {hint_sponsor} (confidence: {additional_ad_content['combinedConfidence']:.0%})")
+                        # Track for deduplication
+                        if hint_normalized and hint_normalized != "unknown brand":
+                            recent_ads[hint_normalized] = ad.end_time
+                    else:
+                        print(f"    ❌ Failed to emit additional ad: {hint_sponsor}")
+                
+                processed_hints.add(hint_normalized)
     
     return {
         "detected": len(ads),
-        "saved": saved_count,
+        "emitted": emitted_count,
         "excluded": excluded_count,
-        "brand_love": brand_love_count
+        "brand_love": brand_love_count,
+        "duplicates": duplicate_count
     }
 
 
@@ -888,13 +1946,20 @@ def main():
     print("=" * 70)
     print("🎙️  Podcast Ad Detection Pipeline")
     print("   Powered by GLiNER2 + Gemini Verification")
+    print("   Architecture: Event-driven with async batched DB writes")
     print("=" * 70)
     print(f"   LLM Weight: {LLM_WEIGHT:.0%} | Model Weight: {MODEL_WEIGHT:.0%} | GLiNER Class: {GLINER_CLASSIFICATION_WEIGHT:.0%}")
     print(f"   Min Confidence: {MIN_CONFIDENCE_TO_SAVE:.0%}")
     print(f"   Skip LLM Threshold: {HIGH_CONFIDENCE_THRESHOLD:.0%}")
+    print(f"   Dedup Window: {AD_DEDUP_WINDOW_SECONDS}s ({AD_DEDUP_WINDOW_SECONDS // 60} min)")
+    print("=" * 70)
+    print("\n📋 Async Writer Configuration:")
+    print(f"   Batch Size: {BATCH_SIZE} events")
+    print(f"   Flush Interval: {FLUSH_INTERVAL_SECONDS}s")
+    print(f"   Max Queue Size: {MAX_QUEUE_SIZE}")
     print("=" * 70)
     print("\n📋 Exclusion Filters Active:")
-    print("   • Patreon/Substack (creator support)")
+    print("   • Patreon/Substack/GoFundMe/BuyMeACoffee/PayPal (creator support)")
     print("   • Social media plugs (self-promotion)")
     print("   • Ad-free subscription offers")
     print("   • Brand love/shoutouts (no commercial intent)")
@@ -903,7 +1968,19 @@ def main():
     print("\n📦 Loading ad detection model (GLiNER2 with full capabilities)...")
     detector = AdDetector()
     
-    print("🔌 Connecting to database...")
+    print("🔌 Initializing async database writer...")
+    writer = AsyncDBWriter(
+        database_url=DATABASE_URL,
+        batch_size=BATCH_SIZE,
+        flush_interval_seconds=FLUSH_INTERVAL_SECONDS,
+        max_queue_size=MAX_QUEUE_SIZE,
+    )
+    writer.start()
+    
+    # Create event emitter for this processing session
+    emitter = AdEventEmitter(writer)
+    
+    print("🔌 Connecting to database for episode fetching...")
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
@@ -917,9 +1994,10 @@ def main():
             return
         
         total_detected = 0
-        total_saved = 0
+        total_emitted = 0
         total_excluded = 0
         total_brand_love = 0
+        total_duplicates = 0
         episodes_processed = 0
         episodes_with_ads = 0
         
@@ -928,23 +2006,42 @@ def main():
             transcript_url = episode['transcriptUrl']
             
             try:
-                result = process_episode(detector, conn, cursor, episode_id, transcript_url)
+                # Process episode - ML inference is CPU-bound
+                # DB writes happen asynchronously via the queue
+                result = process_episode(
+                    detector,
+                    emitter,
+                    episode_id,
+                    transcript_url,
+                )
                 
                 total_detected += result["detected"]
-                total_saved += result["saved"]
+                total_emitted += result["emitted"]
                 total_excluded += result["excluded"]
                 total_brand_love += result["brand_love"]
+                total_duplicates += result["duplicates"]
                 
-                if result["saved"] > 0:
+                if result["emitted"] > 0:
                     episodes_with_ads += 1
                 
-                conn.commit()
                 episodes_processed += 1
+                
+                # Periodically log writer stats
+                if episodes_processed % 10 == 0:
+                    stats = writer.get_stats()
+                    print(f"\n  📊 Writer stats: {stats['events_written']}/{stats['events_received']} written, "
+                          f"{stats['batches_written']} batches")
                 
             except Exception as e:
                 print(f"  ❌ Error processing episode {episode_id}: {e}")
-                conn.rollback()
                 continue
+        
+        # Final flush - ensure all events are written
+        print("\n💾 Flushing remaining events...")
+        writer.flush_sync(timeout=30.0)
+        
+        # Get final writer stats
+        writer_stats = writer.get_stats()
         
         # Final summary
         print("\n" + "=" * 70)
@@ -953,22 +2050,26 @@ def main():
         print(f"   Episodes processed:  {episodes_processed}")
         print(f"   Episodes with ads:   {episodes_with_ads}")
         print(f"   Ads detected:        {total_detected}")
-        print(f"   Ads saved:           {total_saved}")
+        print(f"   Events emitted:      {total_emitted}")
+        print(f"   Events written:      {writer_stats['events_written']}")
+        print(f"   Batches written:     {writer_stats['batches_written']}")
+        print(f"   Write errors:        {writer_stats['errors']}")
         print(f"   Excluded:            {total_excluded}")
-        print(f"   Brand love/shoutouts: {total_brand_love}")
+        print(f"   Brand endorsements:  {total_brand_love}")
+        print(f"   Duplicates skipped:  {total_duplicates}")
         if total_detected > 0:
-            print(f"   Filter rate:         {(1 - total_saved/total_detected)*100:.1f}% noise removed")
+            print(f"   Filter rate:         {(1 - total_emitted/total_detected)*100:.1f}% noise removed")
         print("=" * 70)
         print("✅ Pipeline complete!")
         
     except Exception as e:
         print(f"❌ Fatal error: {e}")
-        conn.rollback()
         raise
     
     finally:
-        cursor.close()
-        conn.close()
+        # Graceful shutdown
+        writer.shutdown(timeout=30.0)
+        safe_close(conn, cursor)
 
 
 if __name__ == "__main__":
